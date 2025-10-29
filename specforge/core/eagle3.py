@@ -383,6 +383,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         processor,
         length: int = 7,
         attention_backend: str = "sdpa",
+        target_model_type: Optional[str] = None,
     ):
         """
         Args:
@@ -396,6 +397,13 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         self.processor = processor
         self.length = length
         self.attention_backend = attention_backend
+        if target_model_type is not None:
+            model_type = target_model_type
+        else:
+            target_config = getattr(target_model, "config", None)
+            model_type = getattr(target_config, "model_type", None)
+        self.target_model_type = model_type
+        self.rope_deltas: Optional[torch.Tensor] = None
 
     @torch.no_grad()
     def _prepare_data(
@@ -404,7 +412,10 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
         device: Optional[torch.device] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -417,7 +428,10 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             loss_mask: (batch, seq_len)
             device: the device to run the target model, if None, use the input_ids device
             pixel_values: image pixel values, used for VLM models
+            pixel_values_videos: video pixel values, used for VLM models supporting videos
             image_grid_thw: image grid thw, used for VLM models
+            video_grid_thw: video grid thw, used for VLM models supporting videos
+            second_per_grid_ts: temporal interval per grid, required by qwen2_5_vl video inputs
 
         Returns:
             hidden_states: (batch, seq_len, 3*hidden_size)
@@ -430,14 +444,28 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             device = input_ids.device
 
         # run the target model to get the hidden states
-        outputs = self.target_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+        target_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "pixel_values_videos": pixel_values_videos,
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_thw,
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
+        if self.target_model_type not in {"qwen3_vl", "qwen3_vl_moe"}:
+            target_kwargs["second_per_grid_ts"] = second_per_grid_ts
+        # remove optional None entries to avoid unexpected kwargs errors
+        filtered_target_kwargs = {}
+        for key, value in target_kwargs.items():
+            if key in {"input_ids", "attention_mask", "output_hidden_states", "use_cache"} or value is not None:
+                filtered_target_kwargs[key] = value
+
+        outputs = self.target_model(**filtered_target_kwargs)
+        rope_deltas = getattr(outputs, "rope_deltas", None)
+        if rope_deltas is not None:
+            self.rope_deltas = rope_deltas
 
         # extract the aux hidden states
         # output_hidden_states = True will return the embedding output as well
@@ -447,9 +475,20 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         num_layers = num_hidden_states - 1
 
         # Eagle3 uses 3 aux layers from layer 1, num_layers//2, num_layers-4
-        low_aux_layer = 1 + offset
-        mid_aux_layer = num_layers // 2 - 1 + offset
-        last_aux_layer = num_layers - 4 + offset
+        eagle3_config_dict = self.draft_model.config.to_dict()
+        eagle_config = eagle3_config_dict.get("eagle_config", None)
+        if (
+            eagle_config is not None
+            and "eagle_aux_hidden_state_layer_ids" in eagle_config
+        ):
+            aux_layer_ids = eagle_config["eagle_aux_hidden_state_layer_ids"]
+            assert len(aux_layer_ids) == 3, "EAGLE3 requires 3 aux layers"
+        else:
+            aux_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
+
+        low_aux_layer = aux_layer_ids[0] + offset
+        mid_aux_layer = aux_layer_ids[1] + offset
+        last_aux_layer = aux_layer_ids[2] + offset
 
         hidden_states0 = outputs.hidden_states[low_aux_layer]
         hidden_states1 = outputs.hidden_states[mid_aux_layer]
@@ -481,9 +520,13 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         # get input embeding with image
         # inputs_embeds = self.target_model.model.get_input_embeddings()(input_ids)
         inputs_embeds = self.draft_model.embed_input_ids(input_ids)
-        image_embeds = self.target_model.model.get_image_features(
+        image_features = self.target_model.model.get_image_features(
             pixel_values, image_grid_thw
         )
+        if self.target_model_type in {"qwen3_vl", "qwen3_vl_moe"}:
+            image_embeds, *_ = image_features
+        else:
+            image_embeds = image_features
         image_embeds = torch.cat(image_embeds, dim=0)
         n_image_tokens = (
             input_ids == self.target_model.model.config.image_token_id
@@ -511,7 +554,10 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
         Online eagle model trainer, modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L711
@@ -524,10 +570,20 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             position_ids: (batch, seq_len)
             pixel_values: batch image pixel values, used for VLM models
             image_grid_thw: (batch, 3), image grid thw, used for VLM models
+            pixel_values_videos: batch video pixel values, optional for models supporting videos
+            video_grid_thw: (batch, 3), video grid thw, optional
+            second_per_grid_ts: per-grid temporal interval for qwen2_5_vl video support
         """
         # Step 0: prepare data with the target model
         hidden_states, target, loss_mask, input_ids = self._prepare_data(
-            input_ids, attention_mask, loss_mask, pixel_values, image_grid_thw
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
         )
 
         # Step 1: handle vocab size
@@ -563,18 +619,26 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                     attention_mask_tensor[:, 0], dim1=1, dim2=2
                 )
                 attention_mask_tensor = (
-                    attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+                    attention_mask_tensor
+                    / torch.finfo(attention_mask_tensor.dtype).min
                 )
                 attention_mask_tensor = (1.0 - attention_mask_tensor).int()
 
+            get_rope_kwargs = {
+                "input_ids": input_ids,
+                "image_grid_thw": image_grid_thw,
+                "attention_mask": attention_mask_tensor,
+            }
+            if self.target_model_type in {"qwen3_vl", "qwen3_vl_moe"}:
+                get_rope_kwargs["video_grid_thw"] = video_grid_thw
+            else:
+                get_rope_kwargs["video_grid_thw"] = video_grid_thw
+                get_rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
             position_ids, rope_deltas = self.target_model.model.get_rope_index(
-                input_ids,
-                image_grid_thw,
-                None,
-                second_per_grid_ts=None,
-                attention_mask=attention_mask_tensor,
+                **get_rope_kwargs
             )
-            self.rope_deltas = rope_deltas
+            if rope_deltas is not None:
+                self.rope_deltas = rope_deltas
         else:
             position_ids = position_ids
 
