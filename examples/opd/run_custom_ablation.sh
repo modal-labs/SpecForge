@@ -1,0 +1,38 @@
+#!/bin/bash
+# Template for custom OPD configurations
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+ROOT_DIR=$(dirname $(dirname $SCRIPT_DIR))
+export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
+
+NUM_GPUS=${1:-1}
+TARGET_MODEL=${TARGET_MODEL:-"Qwen/Qwen3-8B"}
+TRAIN_DATA=${TRAIN_DATA:-"$ROOT_DIR/cache/dataset/sharegpt.jsonl"}
+OUTPUT_DIR=${OUTPUT_DIR:-"$ROOT_DIR/outputs/qwen3-8b-custom"}
+
+# Customize these loss weights
+LAMBDA_CE=${LAMBDA_CE:-0.5}
+LAMBDA_RKL=${LAMBDA_RKL:-0.4}
+BETA_HINGE=${BETA_HINGE:-0.1}
+TTT_LENGTH=${TTT_LENGTH:-7}
+OPD_TEMPERATURE=${OPD_TEMPERATURE:-1.0}
+
+torchrun \
+    --standalone \
+    --nproc_per_node $NUM_GPUS \
+    $ROOT_DIR/scripts/train_eagle3_online.py \
+    --target-model-path $TARGET_MODEL \
+    --train-data-path $TRAIN_DATA \
+    --output-dir $OUTPUT_DIR \
+    --num-epochs 10 \
+    --learning-rate 1e-4 \
+    --max-length 2048 \
+    --chat-template qwen \
+    --cache-dir $ROOT_DIR/cache \
+    --embedding-key model.embed_tokens.weight \
+    --tp-size $NUM_GPUS \
+    --ttt-length $TTT_LENGTH \
+    --lambda-ce $LAMBDA_CE \
+    --lambda-rkl $LAMBDA_RKL \
+    --beta-hinge $BETA_HINGE \
+    --opd-temperature $OPD_TEMPERATURE
