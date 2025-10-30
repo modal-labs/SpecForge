@@ -155,6 +155,31 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+    # OPD (On-Policy Distillation) arguments
+    training_group.add_argument(
+        "--lambda-ce",
+        type=float,
+        default=1.0,
+        help="Weight for cross-entropy loss (default 1.0 for baseline EAGLE-3).",
+    )
+    training_group.add_argument(
+        "--lambda-rkl",
+        type=float,
+        default=0.0,
+        help="Weight for reverse-KL loss (set >0 for OPD, e.g., 0.5 or 1.0).",
+    )
+    training_group.add_argument(
+        "--beta-hinge",
+        type=float,
+        default=0.0,
+        help="Weight for acceptance-aware hinge loss (optional, e.g., 0.1).",
+    )
+    training_group.add_argument(
+        "--opd-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for sampling from student distribution in OPD (default 1.0).",
+    )
 
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
@@ -331,9 +356,9 @@ def sanity_check(args: Namespace) -> None:
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
     if args.attention_backend == "usp":
-        assert (
-            args.train_hidden_states_path is not None
-        ), "train_hidden_states_path should not be None for usp"
+        assert args.train_hidden_states_path is not None, (
+            "train_hidden_states_path should not be None for usp"
+        )
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
@@ -692,12 +717,20 @@ def main():
             processor=processor,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
+            lambda_ce=args.lambda_ce,
+            lambda_rkl=args.lambda_rkl,
+            beta_hinge=args.beta_hinge,
+            opd_temperature=args.opd_temperature,
         )
     else:
         eagle3_model = OnlineEagle3Model(
             draft_model=draft_model,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
+            lambda_ce=args.lambda_ce,
+            lambda_rkl=args.lambda_rkl,
+            beta_hinge=args.beta_hinge,
+            opd_temperature=args.opd_temperature,
         )
 
     eagle3_model = FSDP(

@@ -28,7 +28,11 @@ import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 from yunchang import EXTRACT_FUNC_DICT
 
-from specforge.core.loss import LogSoftmaxLoss
+from specforge.core.loss import (
+    LogSoftmaxLoss,
+    compute_acceptance_hinge_loss,
+    compute_reverse_kl_loss,
+)
 from specforge.distributed import (
     gather_outputs_and_unpad,
     get_sp_ring_group,
@@ -59,17 +63,32 @@ class OnlineEagle3Model(Eagle3Model):
         draft_model: Eagle3DraftModel,
         length: int = 7,
         attention_backend="sdpa",
+        lambda_ce: float = 1.0,
+        lambda_rkl: float = 0.0,
+        beta_hinge: float = 0.0,
+        opd_temperature: float = 1.0,
     ):
         """
         Args:
             target_model: the target model to extract hidden states.
             draft_model: the draft model to be trained.
             length: TTT length, it means how many turns to unroll during TTT.
+            attention_backend: attention backend to use (sdpa or flex_attention).
+            lambda_ce: weight for cross-entropy loss (default 1.0, baseline EAGLE-3).
+            lambda_rkl: weight for reverse-KL loss (default 0.0, set >0 for OPD).
+            beta_hinge: weight for acceptance-aware hinge loss (default 0.0).
+            opd_temperature: temperature for sampling from student (default 1.0).
         """
         super().__init__()
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
+        # OPD configuration
+        self.lambda_ce = lambda_ce
+        self.lambda_rkl = lambda_rkl
+        self.beta_hinge = beta_hinge
+        self.opd_temperature = opd_temperature
+        self.use_opd = lambda_rkl > 0.0 or beta_hinge > 0.0
 
         if self.attention_backend == "usp":
             self.extract_func = EXTRACT_FUNC_DICT["basic"]
@@ -88,6 +107,51 @@ class OnlineEagle3Model(Eagle3Model):
             world_size=self.sp_world_size,
         ).clone()
         return shared_input
+
+    @torch.no_grad()
+    def _query_teacher_log_probs(
+        self,
+        input_ids: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Query teacher model for log probabilities of sampled tokens.
+        This preserves TTT masking: the teacher only sees the context that would be
+        available during speculative decoding (verified prefix + sampled tokens so far).
+
+        Args:
+            input_ids: (B, T) context token IDs (verified prefix)
+            sampled_token_ids: (B, T) token IDs sampled from student
+            attention_mask: (B, T) attention mask for context
+
+        Returns:
+            teacher_log_probs: (B, T) log probabilities from teacher for sampled tokens
+        """
+        batch_size, seq_length = input_ids.shape
+
+        # Run teacher forward pass on the context
+        # Note: input_ids at this point already contains the context we want
+        # (either the original sequence at step 1, or the accumulated sampled tokens)
+        outputs = self.target_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+
+        # Get teacher logits and compute log probabilities
+        teacher_logits = outputs.logits  # (B, T, V)
+        teacher_log_probs_all = torch.nn.functional.log_softmax(
+            teacher_logits.float(), dim=-1
+        )
+
+        # Gather log probs for sampled tokens
+        sampled_token_ids_expanded = sampled_token_ids.unsqueeze(-1)  # (B, T, 1)
+        teacher_log_probs = torch.gather(
+            teacher_log_probs_all, dim=-1, index=sampled_token_ids_expanded
+        ).squeeze(-1)  # (B, T)
+
+        return teacher_log_probs
 
     def forward(
         self,
@@ -217,8 +281,61 @@ class OnlineEagle3Model(Eagle3Model):
                     )
                 )
 
-            # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            # Step 5.6: calculate loss
+            # Save logits for OPD before in-place modification
+            if self.use_opd:
+                logits_for_opd = logits.detach().clone()
+
+            # CE loss (in-place modifies logits!)
+            if self.lambda_ce > 0.0:
+                ce_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+                loss = self.lambda_ce * ce_loss
+            else:
+                loss = 0.0
+
+            # OPD losses (reverse-KL and acceptance-hinge)
+            if self.use_opd:
+                # Sample tokens from student distribution
+                with torch.no_grad():
+                    # Apply temperature scaling
+                    student_probs = torch.nn.functional.softmax(
+                        logits_for_opd / self.opd_temperature, dim=-1
+                    )
+                    # Sample from student distribution
+                    sampled_token_ids = torch.multinomial(
+                        student_probs.view(-1, student_probs.size(-1)),
+                        num_samples=1,
+                    ).view(student_probs.size(0), student_probs.size(1))
+
+                    # Query teacher log-probs on sampled tokens
+                    # Important: We use the current input_ids as context, which preserves
+                    # TTT masking (teacher only sees verified prefix + sampled tokens so far)
+                    teacher_log_probs = self._query_teacher_log_probs(
+                        input_ids=input_ids,
+                        sampled_token_ids=sampled_token_ids,
+                        attention_mask=attention_mask,
+                    )
+
+                # Compute reverse-KL loss
+                if self.lambda_rkl > 0.0:
+                    rkl_loss = compute_reverse_kl_loss(
+                        student_logits=logits_for_opd,
+                        teacher_log_probs=teacher_log_probs,
+                        sampled_token_ids=sampled_token_ids,
+                        position_mask=position_mask,
+                    )
+                    loss = loss + self.lambda_rkl * rkl_loss
+
+                # Compute acceptance-hinge loss
+                if self.beta_hinge > 0.0:
+                    hinge_loss = compute_acceptance_hinge_loss(
+                        student_logits=logits_for_opd,
+                        teacher_log_probs=teacher_log_probs,
+                        sampled_token_ids=sampled_token_ids,
+                        position_mask=position_mask,
+                    )
+                    loss = loss + self.beta_hinge * hinge_loss
+
             plosses.append(loss)
 
             if not is_last:
@@ -249,12 +366,21 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         processor,
         length: int = 7,
         attention_backend: str = "sdpa",
+        lambda_ce: float = 1.0,
+        lambda_rkl: float = 0.0,
+        beta_hinge: float = 0.0,
+        opd_temperature: float = 1.0,
     ):
         """
         Args:
             target_model: the target model to extract hidden states.
             draft_model: the draft model to be trained.
             length: TTT length, it means how many turns to unroll during TTT.
+            attention_backend: attention backend to use (sdpa or flex_attention).
+            lambda_ce: weight for cross-entropy loss (default 1.0, baseline EAGLE-3).
+            lambda_rkl: weight for reverse-KL loss (default 0.0, set >0 for OPD).
+            beta_hinge: weight for acceptance-aware hinge loss (default 0.0).
+            opd_temperature: temperature for sampling from student (default 1.0).
         """
         super().__init__()
         self.target_model = target_model
@@ -262,6 +388,12 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         self.processor = processor
         self.length = length
         self.attention_backend = attention_backend
+        # OPD configuration
+        self.lambda_ce = lambda_ce
+        self.lambda_rkl = lambda_rkl
+        self.beta_hinge = beta_hinge
+        self.opd_temperature = opd_temperature
+        self.use_opd = lambda_rkl > 0.0 or beta_hinge > 0.0
 
     @torch.no_grad()
     def _prepare_data(
@@ -336,6 +468,55 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             loss_mask = loss_mask.to(device)
 
         return hidden_states, target, loss_mask, input_ids
+
+    @torch.no_grad()
+    def _query_teacher_log_probs(
+        self,
+        input_ids: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Query teacher model for log probabilities of sampled tokens.
+        This preserves TTT masking: the teacher only sees the context that would be
+        available during speculative decoding (verified prefix + sampled tokens so far).
+
+        Args:
+            input_ids: (B, T) context token IDs (verified prefix)
+            sampled_token_ids: (B, T) token IDs sampled from student
+            attention_mask: (B, T) or dict with attention mask for context
+            pixel_values: batch image pixel values, used for VLM models
+            image_grid_thw: (batch, 3), image grid thw, used for VLM models
+
+        Returns:
+            teacher_log_probs: (B, T) log probabilities from teacher for sampled tokens
+        """
+        batch_size, seq_length = input_ids.shape
+
+        # Run teacher forward pass on the context
+        outputs = self.target_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            use_cache=False,
+        )
+
+        # Get teacher logits and compute log probabilities
+        teacher_logits = outputs.logits  # (B, T, V)
+        teacher_log_probs_all = torch.nn.functional.log_softmax(
+            teacher_logits.float(), dim=-1
+        )
+
+        # Gather log probs for sampled tokens
+        sampled_token_ids_expanded = sampled_token_ids.unsqueeze(-1)  # (B, T, 1)
+        teacher_log_probs = torch.gather(
+            teacher_log_probs_all, dim=-1, index=sampled_token_ids_expanded
+        ).squeeze(-1)  # (B, T)
+
+        return teacher_log_probs
 
     @torch.no_grad()
     def _get_input_embeds(
@@ -508,8 +689,63 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                     )
                 )
 
-            # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            # Step 5.6: calculate loss
+            # Save logits for OPD before in-place modification
+            if self.use_opd:
+                logits_for_opd = logits.detach().clone()
+
+            # CE loss (in-place modifies logits!)
+            if self.lambda_ce > 0.0:
+                ce_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+                loss = self.lambda_ce * ce_loss
+            else:
+                loss = 0.0
+
+            # OPD losses (reverse-KL and acceptance-hinge)
+            if self.use_opd:
+                # Sample tokens from student distribution
+                with torch.no_grad():
+                    # Apply temperature scaling
+                    student_probs = torch.nn.functional.softmax(
+                        logits_for_opd / self.opd_temperature, dim=-1
+                    )
+                    # Sample from student distribution
+                    sampled_token_ids = torch.multinomial(
+                        student_probs.view(-1, student_probs.size(-1)),
+                        num_samples=1,
+                    ).view(student_probs.size(0), student_probs.size(1))
+
+                    # Query teacher log-probs on sampled tokens
+                    # Important: We use the current input_ids as context, which preserves
+                    # TTT masking (teacher only sees verified prefix + sampled tokens so far)
+                    teacher_log_probs = self._query_teacher_log_probs(
+                        input_ids=input_ids,
+                        sampled_token_ids=sampled_token_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                    )
+
+                # Compute reverse-KL loss
+                if self.lambda_rkl > 0.0:
+                    rkl_loss = compute_reverse_kl_loss(
+                        student_logits=logits_for_opd,
+                        teacher_log_probs=teacher_log_probs,
+                        sampled_token_ids=sampled_token_ids,
+                        position_mask=position_mask,
+                    )
+                    loss = loss + self.lambda_rkl * rkl_loss
+
+                # Compute acceptance-hinge loss
+                if self.beta_hinge > 0.0:
+                    hinge_loss = compute_acceptance_hinge_loss(
+                        student_logits=logits_for_opd,
+                        teacher_log_probs=teacher_log_probs,
+                        sampled_token_ids=sampled_token_ids,
+                        position_mask=position_mask,
+                    )
+                    loss = loss + self.beta_hinge * hinge_loss
+
             plosses.append(loss)
 
             if not is_last:
