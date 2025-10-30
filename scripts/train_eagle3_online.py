@@ -89,6 +89,32 @@ def parse_args():
         help="The length for Test-Time Training (TTT).",
     )
 
+    # OPD (On-Policy Distillation) arguments
+    parser.add_argument(
+        "--lambda-ce",
+        type=float,
+        default=1.0,
+        help="Weight for cross-entropy loss (default 1.0 for baseline EAGLE-3).",
+    )
+    parser.add_argument(
+        "--lambda-rkl",
+        type=float,
+        default=0.0,
+        help="Weight for reverse-KL loss (set >0 for OPD, e.g., 0.5 or 1.0).",
+    )
+    parser.add_argument(
+        "--beta-hinge",
+        type=float,
+        default=0.0,
+        help="Weight for acceptance-aware hinge loss (optional, e.g., 0.1).",
+    )
+    parser.add_argument(
+        "--opd-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for sampling from student distribution in OPD (default 1.0).",
+    )
+
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
     parser.add_argument(
@@ -403,6 +429,10 @@ def main():
             processor=processor,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
+            lambda_ce=args.lambda_ce,
+            lambda_rkl=args.lambda_rkl,
+            beta_hinge=args.beta_hinge,
+            opd_temperature=args.opd_temperature,
         )
     else:
         eagle3_model = OnlineEagle3Model(
@@ -410,6 +440,10 @@ def main():
             draft_model=draft_model,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
+            lambda_ce=args.lambda_ce,
+            lambda_rkl=args.lambda_rkl,
+            beta_hinge=args.beta_hinge,
+            opd_temperature=args.opd_temperature,
         )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
     eagle3_model = FSDP(

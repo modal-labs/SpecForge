@@ -228,6 +228,99 @@ class LogSoftmaxLoss(torch.autograd.Function):
         return logits, None, None, None, None
 
 
+# On-Policy Distillation Losses
+
+@torch.compile(dynamic=None)
+def compute_reverse_kl_loss(
+    student_logits: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
+    position_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute reverse KL divergence loss for on-policy distillation.
+
+    Args:
+        student_logits: (B, T, V) logits from student/drafter model
+        teacher_log_probs: (B, T) log probabilities from teacher for sampled tokens
+        sampled_token_ids: (B, T) token IDs sampled from student distribution
+        position_mask: (B, T, 1) mask indicating valid positions
+
+    Returns:
+        Scalar loss: E_{y~q}[log q(y) - log p(y)]
+    """
+    # Compute log softmax of student logits
+    student_log_probs_all = torch.nn.functional.log_softmax(
+        student_logits.float(), dim=-1
+    )
+
+    # Gather log probs for sampled tokens
+    # sampled_token_ids: (B, T) -> (B, T, 1) for gather
+    sampled_token_ids_expanded = sampled_token_ids.unsqueeze(-1)
+    student_log_probs = torch.gather(
+        student_log_probs_all, dim=-1, index=sampled_token_ids_expanded
+    ).squeeze(-1)  # (B, T)
+
+    # Compute reverse KL: log q(y) - log p(y)
+    reverse_kl = student_log_probs - teacher_log_probs  # (B, T)
+
+    # Apply position mask and compute mean
+    position_mask_2d = position_mask.squeeze(-1)  # (B, T)
+    masked_reverse_kl = reverse_kl * position_mask_2d
+
+    # Mean over valid positions
+    loss = masked_reverse_kl.sum() / position_mask_2d.sum().clamp_min(1e-6)
+
+    return loss
+
+
+@torch.compile(dynamic=None)
+def compute_acceptance_hinge_loss(
+    student_logits: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
+    position_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute acceptance-aware hinge loss: E_{y~q}[max(0, log q(y) - log p(y))].
+
+    This penalizes the student for being overconfident relative to the teacher,
+    which directly reduces rejection probability in speculative sampling.
+
+    Args:
+        student_logits: (B, T, V) logits from student/drafter model
+        teacher_log_probs: (B, T) log probabilities from teacher for sampled tokens
+        sampled_token_ids: (B, T) token IDs sampled from student distribution
+        position_mask: (B, T, 1) mask indicating valid positions
+
+    Returns:
+        Scalar loss: E_{y~q}[max(0, log q(y) - log p(y))]
+    """
+    # Compute log softmax of student logits
+    student_log_probs_all = torch.nn.functional.log_softmax(
+        student_logits.float(), dim=-1
+    )
+
+    # Gather log probs for sampled tokens
+    sampled_token_ids_expanded = sampled_token_ids.unsqueeze(-1)
+    student_log_probs = torch.gather(
+        student_log_probs_all, dim=-1, index=sampled_token_ids_expanded
+    ).squeeze(-1)  # (B, T)
+
+    # Compute hinge: max(0, log q(y) - log p(y))
+    log_ratio = student_log_probs - teacher_log_probs  # (B, T)
+    hinge = torch.nn.functional.relu(log_ratio)  # (B, T)
+
+    # Apply position mask and compute mean
+    position_mask_2d = position_mask.squeeze(-1)  # (B, T)
+    masked_hinge = hinge * position_mask_2d
+
+    # Mean over valid positions
+    loss = masked_hinge.sum() / position_mask_2d.sum().clamp_min(1e-6)
+
+    return loss
+
+
 if __name__ == "__main__":
     device = "cuda"
     B, T, V = 1, 1024, 16000
