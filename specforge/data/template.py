@@ -186,3 +186,13 @@ TEMPLATE_REGISTRY.register(
         parser_type="openai-harmony",
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="glm4_moe",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>",
+        user_header="<|user|>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token=None,
+    )
+)
