@@ -14,9 +14,10 @@
 # limitations under the License.
 
 from collections.abc import Callable
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -35,6 +36,10 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import check_model_inputs
 
+from specforge.distributed import get_tp_group
+from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+from .base import DistributedTargetModel
 
 class Glm4MoeRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
@@ -200,16 +205,52 @@ class Glm4MoeAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        # TP support
+        self.tp_group = get_tp_group()
+        self.tp_size = (
+            dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
         )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        self.tp_rank = dist.get_rank(self.tp_group) if self.tp_group is not None else 0
+
+        # head distribution
+        self.total_num_heads = config.num_attention_heads
+        self.total_num_kv_heads = config.num_key_value_heads
+        self.num_heads = self.total_num_heads // self.tp_size
+
+        # kv head replication
+        if self.tp_size > self.total_num_kv_heads:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = self.tp_size // self.total_num_kv_heads
+            self.num_key_value_groups = self.num_heads // self.num_kv_heads
+            self.kv_head_replicas = True
+        else:
+            self.num_kv_heads = self.total_num_kv_heads
+            self.num_kv_head_replicas = 1
+            self.num_key_value_groups = config.num_attention_heads // self.num_kv_heads
+            self.kv_head_replicas = False
+
+        self.q_proj = ColumnParallelLinear(
+            config.hidden_size,
+            config.num_attention_heads * self.head_dim,
+            bias=config.attention_bias,
         )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        self.k_proj = ColumnParallelLinear(
+            config.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=config.attention_bias,
+            kv_head_replicas=self.kv_head_replicas,
         )
-        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        self.v_proj = ColumnParallelLinear(
+            config.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=config.attention_bias,
+            kv_head_replicas=self.kv_head_replicas,
+        )
+        self.o_proj = RowParallelLinear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            bias=False
+        )
         self.use_qk_norm = config.use_qk_norm
         if self.use_qk_norm:
             self.q_norm = Glm4MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -264,6 +305,8 @@ class Glm4MoeAttention(nn.Module):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+        # tp support
+        dist.all_reduce(attn_output, op=dist.ReduceOp.SUM, group=self.tp_group)
         return attn_output, attn_weights
 
 
@@ -273,13 +316,29 @@ class Glm4MoeMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        # tp support
+        self.tp_group = get_tp_group()
+        self.gate_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=False
+        )
+        self.up_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=False
+        )
+        self.down_proj = RowParallelLinear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=False
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        # tp support
+        dist.all_reduce(down_proj, op=dist.ReduceOp.SUM, group=self.tp_group)
         return down_proj
 
 
@@ -577,7 +636,11 @@ class Glm4MoeForCausalLM(Glm4MoePreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Glm4MoeModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -630,6 +693,9 @@ class Glm4MoeForCausalLM(Glm4MoePreTrainedModel, GenerationMixin):
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        # tp support
+        logits = self._gather_tensor(logits, get_tp_group())
+
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
@@ -642,6 +708,86 @@ class Glm4MoeForCausalLM(Glm4MoePreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
 
+    def load_weights(self, state_dict: Dict[str, torch.Tensor]):
+        tp_group = get_tp_group()
+        tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        should_shard = tp_group is not None and tp_size > 1
+
+        def shard_tensor(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+            if not should_shard:
+                return tensor
+            return self._shard_tensor(tensor, tp_group, dim)
+
+        updated_state_dict: Dict[str, torch.Tensor] = {}
+
+        for key, value in state_dict.items():
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(
+                    f"Expected all values in the state dict to be torch.Tensor. Found {type(value)} instead."
+                )
+
+            module_key = ".".join(key.split(".")[:-1])
+            try:
+                module = self.get_submodule(module_key)
+            except AttributeError:
+                # Skip parameters that do not correspond to a real module (e.g. obsolete keys)
+                continue
+
+            handled = False
+
+            # Handle attention projections explicitly for sharding & KV replicas.
+            if "self_attn" in key:
+                layer_idx = None
+                layer_parts = key.split(".")
+                for idx, part in enumerate(layer_parts):
+                    if part == "layers" and idx + 1 < len(layer_parts):
+                        try:
+                            layer_idx = int(layer_parts[idx + 1])
+                            break
+                        except (ValueError, IndexError):
+                            continue
+
+                attention_layer = (
+                    self.model.layers[layer_idx].self_attn if layer_idx is not None else None
+                )
+
+                if attention_layer is not None:
+                    head_dim = attention_layer.head_dim
+                    if key.endswith(("q_proj.weight", "q_proj.bias")):
+                        value = shard_tensor(value, 0)
+                        handled = True
+                    elif key.endswith(("k_proj.weight", "v_proj.weight", "k_proj.bias", "v_proj.bias")):
+                        if should_shard and tp_size > attention_layer.total_num_kv_heads:
+                            kv_shard_id = tp_rank // attention_layer.num_kv_head_replicas
+                            start_idx = kv_shard_id * head_dim
+                            if value.ndim == 2:
+                                value = value.narrow(0, start_idx, head_dim).contiguous()
+                            else:
+                                value = value.narrow(0, start_idx, head_dim).contiguous()
+                        else:
+                            value = shard_tensor(value, 0)
+                        handled = True
+                    elif key.endswith(("o_proj.weight", "o_proj.bias")):
+                        value = shard_tensor(value, -1)
+                        handled = True
+
+            if not handled and isinstance(module, RowParallelLinear) and key.endswith(".weight"):
+                value = shard_tensor(value, -1)
+                handled = True
+            elif not handled and isinstance(module, RowParallelLinear) and key.endswith(".bias"):
+                value = shard_tensor(value, 0)
+                handled = True
+            elif not handled and isinstance(module, ColumnParallelLinear) and key.endswith(".weight"):
+                value = shard_tensor(value, 0)
+                handled = True
+            elif not handled and isinstance(module, ColumnParallelLinear) and key.endswith(".bias"):
+                value = shard_tensor(value, 0)
+                handled = True
+
+            updated_state_dict[key] = value
+
+        self.load_state_dict(updated_state_dict, strict=False)
+
 
 __all__ = ["Glm4MoePreTrainedModel", "Glm4MoeModel", "Glm4MoeForCausalLM"]
-
