@@ -18,6 +18,7 @@
   "intermediate_size": 12288,
   "max_position_embeddings": 131072,
   "model_type": "llama",
+  "target_model_type": "glm4_moe",
   "moe_intermediate_size": 1536,
   "norm_topk_prob": true,
   "num_attention_heads": 96,

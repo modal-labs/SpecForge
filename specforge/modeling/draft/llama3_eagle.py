@@ -582,11 +582,18 @@ class LlamaAttention(nn.Module):
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
-            self.rotary_emb = LlamaRotaryEmbedding(
-                self.head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                base=getattr(self.config, "rope_theta", 10000),
-            )
+            target_model_type = getattr(self.config, "target_model_type", None)
+            print(f"target_model_type {target_model_type}")
+            if target_model_type == "glm4_moe":
+                self.rotary_emb = Glm4MoeRotaryEmbedding(
+                    config=self.config,
+                )
+            else:
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
+                )
         else:
             scaling_type = self.config.rope_scaling["rope_type"]
             if hasattr(self.config.rope_scaling, "factor"):
@@ -672,6 +679,15 @@ class LlamaAttention(nn.Module):
                     sin,
                     self.config.rope_scaling["mrope_section"],
                 )
+            elif isinstance(self.rotary_emb, Glm4MoeRotaryEmbedding):
+                cos, sin = self.rotary_emb(query_states, position_ids)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_neox_rotary_pos_emb(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin
+                )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
@@ -702,6 +718,15 @@ class LlamaAttention(nn.Module):
                     cos,
                     sin,
                     self.config.rope_scaling["mrope_section"],
+                )
+            elif isinstance(self.rotary_emb, Glm4MoeRotaryEmbedding):
+                cos, sin = self.rotary_emb(query_states, position_ids + lck)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_neox_rotary_pos_emb(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
                 )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
