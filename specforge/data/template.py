@@ -193,6 +193,6 @@ TEMPLATE_REGISTRY.register(
         assistant_header="<|assistant|>",
         user_header="<|user|>",
         system_prompt="You are a helpful assistant.",
-        end_of_turn_token=None,
+        end_of_turn_token="",
     )
 )
