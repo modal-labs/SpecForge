@@ -897,7 +897,7 @@ class LlamaFlexAttention(LlamaAttention):
         # TODO: Remove the usage of uncompiled create_block_mask after
         # https://github.com/pytorch/pytorch/issues/160018
         if q_len <= 128:
-            create_block_mask_func = create_block_mask
+            create_block_mask_func = compile_friendly_create_block_mask
             flex_attention_func = flex_attention
         else:
             create_block_mask_func = compile_friendly_create_block_mask
