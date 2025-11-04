@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from collections.abc import Callable
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -41,6 +41,43 @@ from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .base import DistributedTargetModel
 
+
+def _ensure_rope_parameters(config: Glm4MoeConfig) -> Dict[str, Any]:
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters is None:
+        rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": getattr(config, "rope_theta", 1000000),
+        }
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is not None:
+            rope_parameters["rope_scaling"] = rope_scaling
+    else:
+        rope_parameters = dict(rope_parameters)
+        rope_parameters.setdefault("rope_type", "default")
+        rope_parameters.setdefault("rope_theta", getattr(config, "rope_theta", 1000000))
+        if "rope_scaling" not in rope_parameters:
+            rope_scaling = getattr(config, "rope_scaling", None)
+            if rope_scaling is not None:
+                rope_parameters["rope_scaling"] = rope_scaling
+
+    setattr(config, "rope_parameters", rope_parameters)
+    return rope_parameters
+
+
+def _ensure_num_local_experts(config: Glm4MoeConfig) -> int:
+    num_local_experts = getattr(config, "num_local_experts", None)
+    if num_local_experts is None:
+        num_local_experts = getattr(config, "n_routed_experts", None)
+        if num_local_experts is None:
+            num_local_experts = getattr(config, "num_experts", None)
+        if num_local_experts is None:
+            raise AttributeError(
+                "Glm4MoeConfig must define either `num_local_experts`, `n_routed_experts`, or `num_experts`."
+            )
+        setattr(config, "num_local_experts", num_local_experts)
+    return num_local_experts
+
 class Glm4MoeRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
@@ -50,8 +87,9 @@ class Glm4MoeRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
+        self.rope_parameters = _ensure_rope_parameters(config)
 
-        self.rope_type = self.config.rope_parameters["rope_type"]
+        self.rope_type = self.rope_parameters["rope_type"]
         rope_init_fn: Callable = self.compute_default_rope_parameters
         if self.rope_type != "default":
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
@@ -79,7 +117,8 @@ class Glm4MoeRotaryEmbedding(nn.Module):
             Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
             post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
         """
-        base = config.rope_parameters["rope_theta"]
+        rope_parameters = _ensure_rope_parameters(config)
+        base = rope_parameters["rope_theta"]
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         dim = int(head_dim * partial_rotary_factor)
@@ -201,7 +240,7 @@ class Glm4MoeAttention(nn.Module):
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
-        self.rope_parameters = config.rope_parameters
+        self.rope_parameters = _ensure_rope_parameters(config)
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
@@ -390,7 +429,7 @@ class Glm4MoeNaiveMoe(nn.ModuleList):
 
     def __init__(self, config):
         super().__init__()
-        self.num_experts = config.num_local_experts
+        self.num_experts = _ensure_num_local_experts(config)
         for _ in range(self.num_experts):
             self.append(Glm4MoeMLP(config, intermediate_size=config.moe_intermediate_size))
 
@@ -551,6 +590,7 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
 
     def __init__(self, config: Glm4MoeConfig):
         super().__init__(config)
+        _ensure_num_local_experts(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -565,7 +605,7 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs()
+    @check_model_inputs
     @auto_docstring
     def forward(
         self,
@@ -627,7 +667,7 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
 
 
 @auto_docstring
-class Glm4MoeForCausalLM(Glm4MoePreTrainedModel, GenerationMixin):
+class Glm4MoeForCausalLM(Glm4MoePreTrainedModel, GenerationMixin, DistributedTargetModel):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
