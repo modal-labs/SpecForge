@@ -1,4 +1,5 @@
-from typing import ClassVar, List, Optional, Tuple
+from collections import OrderedDict
+from typing import Callable, ClassVar, List, Optional, Tuple
 
 import torch
 import torch._dynamo as dynamo
@@ -20,8 +21,10 @@ class WrappedFlexAttention:
     """
 
     _instance = None
-    _is_flex_compiled = False
-    _compiled_flex_attention = None
+    _cache_size: ClassVar[int] = 32
+    _compiled_flex_attention: ClassVar[
+        OrderedDict[Tuple[str, torch.dtype, int, int, int, int], Callable]
+    ] = OrderedDict()
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -31,19 +34,40 @@ class WrappedFlexAttention:
 
     @torch.compiler.disable(recursive=False)
     def __init__(self):
-        """
-        Initialize or update the singleton instance.
-        """
-        if not self._is_flex_compiled:
-            # Enable dynamic shapes to handle different input sizes
-            self._compiled_flex_attention = torch.compile(
-                flex_attention,
-                # mode="max-autotune-no-cudagraphs",
-            )
-            self._is_flex_compiled = True
+        # Lazy compilation happens on first call per shape.
+        pass
 
-    def __call__(self):
-        return self._compiled_flex_attention
+    def _get_compiled(
+        self,
+        compile_key: Tuple[str, torch.dtype, int, int, int, int],
+    ) -> Callable:
+        if compile_key in self._compiled_flex_attention:
+            self._compiled_flex_attention.move_to_end(compile_key)
+            return self._compiled_flex_attention[compile_key]
+
+        compiled_fn = torch.compile(flex_attention, dynamic=True)
+        self._compiled_flex_attention[compile_key] = compiled_fn
+        if len(self._compiled_flex_attention) > self._cache_size:
+            self._compiled_flex_attention.popitem(last=False)
+        return compiled_fn
+
+    def __call__(self, query, key, value, **kwargs):
+        compile_key = (
+            query.device.type,
+            query.dtype,
+            query.shape[1],
+            key.shape[1],
+            query.shape[-2],
+            key.shape[-2],
+        )
+        compiled_fn = self._get_compiled(compile_key)
+        try:
+            return compiled_fn(query, key, value, **kwargs)
+        except RuntimeError as exc:
+            if "illegal memory" in str(exc).lower():
+                self._compiled_flex_attention.pop(compile_key, None)
+                return flex_attention(query, key, value, **kwargs)
+            raise
 
 
 def compile_friendly_flex_attention(
@@ -54,21 +78,23 @@ def compile_friendly_flex_attention(
 ) -> torch.Tensor:
     # First call initialise singleton wrapper object, second call invokes the object method to return compiled flex attention
     # Do not use compiled version if already compiling forward (it raises issues)
-    flex_attention_compiled = (
-        WrappedFlexAttention()() if not is_torchdynamo_compiling() else flex_attention
-    )
+    if is_torchdynamo_compiling():
+        return flex_attention(query, key, value, **kwargs)
+    flex_attention_compiled = WrappedFlexAttention()
     return flex_attention_compiled(
-        query,
-        key,
-        value,
+        query=query,
+        key=key,
+        value=value,
         **kwargs,
     )
 
 
 class WrappedCreateBlockMask:
     _instance = None
-    _is_create_block_mask_compiled = False
-    _compiled_create_block_mask = None
+    _cache_size: ClassVar[int] = 32
+    _compiled_create_block_mask: ClassVar[
+        OrderedDict[Tuple[str, int, int, int, int, str], Callable]
+    ] = OrderedDict()
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -77,12 +103,39 @@ class WrappedCreateBlockMask:
 
     @torch.compiler.disable(recursive=False)
     def __init__(self):
-        if not self._is_create_block_mask_compiled:
-            self._compiled_create_block_mask = torch.compile(create_block_mask)
-            self._is_create_block_mask_compiled = True
+        pass
 
-    def __call__(self):
-        return self._compiled_create_block_mask
+    def _get_compiled(
+        self,
+        compile_key: Tuple[str, int, int, int, int, str],
+    ) -> Callable:
+        if compile_key in self._compiled_create_block_mask:
+            self._compiled_create_block_mask.move_to_end(compile_key)
+            return self._compiled_create_block_mask[compile_key]
+        compiled_fn = torch.compile(create_block_mask, dynamic=True)
+        self._compiled_create_block_mask[compile_key] = compiled_fn
+        if len(self._compiled_create_block_mask) > self._cache_size:
+            self._compiled_create_block_mask.popitem(last=False)
+        return compiled_fn
+
+    def __call__(self, mask_mod, B, H, Q_LEN, KV_LEN, device):
+        mask_mod_name = getattr(mask_mod, "__name__", str(id(mask_mod)))
+        compile_key = (
+            device.type,
+            B,
+            H,
+            Q_LEN,
+            KV_LEN,
+            mask_mod_name,
+        )
+        compiled_fn = self._get_compiled(compile_key)
+        try:
+            return compiled_fn(mask_mod, B, H, Q_LEN, KV_LEN, device)
+        except RuntimeError as exc:
+            if "illegal memory" in str(exc).lower():
+                self._compiled_create_block_mask.pop(compile_key, None)
+                return create_block_mask(mask_mod, B, H, Q_LEN, KV_LEN, device)
+            raise
 
 
 def compile_friendly_create_block_mask(
@@ -93,11 +146,16 @@ def compile_friendly_create_block_mask(
     KV_LEN,
     device,
 ):
-    create_block_mask_compiled = (
-        WrappedCreateBlockMask()()
-        if not is_torchdynamo_compiling()
-        else create_block_mask
-    )
+    if is_torchdynamo_compiling():
+        return create_block_mask(
+            mask_mod,
+            B,
+            H,
+            Q_LEN,
+            KV_LEN,
+            device,
+        )
+    create_block_mask_compiled = WrappedCreateBlockMask()
     return create_block_mask_compiled(
         mask_mod,
         B,

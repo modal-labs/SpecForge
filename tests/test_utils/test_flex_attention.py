@@ -76,23 +76,18 @@ class TestFlexAttention(unittest.TestCase):
         position_ids = (
             torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to("cuda")
         )
-        cache_hidden = [[], []]  # [cache_k, cache_v]
-        attention_mask = torch.ones(batch_size, seq_len, dtype=self.dtype).to("cuda")
+        cache_hidden = None
+        attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool).to("cuda")
         # Simulate one item in the batch is masked and not taking a full block.
         padding_start_index = seq_len - min(
             200, seq_len // 3
         )  # Adjust padding based on seq_len
         attention_mask[1, padding_start_index:] = False
+        sdpa_attention_mask = attention_mask.clone()
         input_embeds = norm_tensor(
             (batch_size, seq_len, self.config.hidden_size),
             device="cuda",
             dtype=self.dtype,
-        )
-        decoder_attention_mask = prepare_decoder_attention_mask(
-            attention_mask=attention_mask,
-            input_shape=(batch_size, seq_len),
-            inputs_embeds=input_embeds,
-            past_key_values_length=0,
         )
         hidden_states_list = []
         flex_hidden_states_list = []
@@ -106,15 +101,23 @@ class TestFlexAttention(unittest.TestCase):
 
         ############### Flex Attention Inputs ##############
         flex_position_ids = position_ids.clone()
+        past_key_values_sdpa = DynamicCache()
         past_key_values = DynamicCache()
         for idx in range(TTT_LENGTH):
             is_last = idx == TTT_LENGTH - 1
+            decoder_attention_mask = prepare_decoder_attention_mask(
+                attention_mask=sdpa_attention_mask,
+                input_shape=(batch_size, seq_len),
+                inputs_embeds=input_embeds,
+                past_key_values_length=past_key_values_sdpa.get_seq_length(),
+            )
             with torch.no_grad():
                 output = attention(
                     hidden_states=hidden_states_list[idx],
                     attention_mask=decoder_attention_mask,
                     position_ids=position_ids,
                     cache_hidden=cache_hidden,
+                    past_key_values=past_key_values_sdpa,
                     output_attentions=False,
                     use_cache=True,
                 )
@@ -142,6 +145,9 @@ class TestFlexAttention(unittest.TestCase):
             self.assertFalse(torch.isnan(output_flex).any())
             self.assertFalse(torch.isinf(output_flex).any())
 
+            if not is_last:
+                sdpa_attention_mask = padding(sdpa_attention_mask, left=False)
+
     def test_backward_pass_gradient_comparison(self):
         """Test backward pass comparing gradients between LlamaAttention and LlamaFlexAttention."""
         for seq_len in self.seq_lengths:
@@ -167,26 +173,22 @@ class TestFlexAttention(unittest.TestCase):
         position_ids = (
             torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to("cuda")
         )
-        cache_hidden = [[], []]  # [cache_k, cache_v]
+        cache_hidden = None
         attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool).to("cuda")
         # Simulate one item in the batch is masked and not taking a full block.
         # padding_start_index = seq_len - 50
         # attention_mask[1, padding_start_index:] = False
+        sdpa_attention_mask = attention_mask.clone()
         input_embeds = norm_tensor(
             (batch_size, seq_len, self.config.hidden_size),
             device="cuda",
             dtype=self.dtype,
         )
-        decoder_attention_mask = prepare_decoder_attention_mask(
-            attention_mask=attention_mask,
-            input_shape=(batch_size, seq_len),
-            inputs_embeds=input_embeds,
-            past_key_values_length=0,
-        )
 
         ############### Flex Attention Inputs ##############
         flex_position_ids = position_ids.clone()
         ttt_length = TTT_LENGTH
+        past_key_values_sdpa = DynamicCache()
         past_key_values = DynamicCache()
         loss_mask = torch.ones(
             batch_size, seq_len, dtype=self.dtype, requires_grad=False
@@ -207,11 +209,18 @@ class TestFlexAttention(unittest.TestCase):
 
         for idx in range(TTT_LENGTH):
             is_last = idx == TTT_LENGTH - 1
+            decoder_attention_mask = prepare_decoder_attention_mask(
+                attention_mask=sdpa_attention_mask,
+                input_shape=(batch_size, seq_len),
+                inputs_embeds=input_embeds,
+                past_key_values_length=past_key_values_sdpa.get_seq_length(),
+            )
             output = attention(
                 hidden_states=hidden_states_list[idx],
                 attention_mask=decoder_attention_mask,
                 position_ids=position_ids,
                 cache_hidden=cache_hidden,
+                past_key_values=past_key_values_sdpa,
                 output_attentions=False,
                 use_cache=True,
             )
@@ -230,8 +239,8 @@ class TestFlexAttention(unittest.TestCase):
             # Compare gradients
 
             if not is_last:
-                # Step 5.7: we need to update the loss mask
                 loss_mask = padding(loss_mask, left=False)
+                sdpa_attention_mask = padding(sdpa_attention_mask, left=False)
         mean_loss = sum(loss_list) / len(loss_list)
         mean_loss_flex = sum(loss_flex_list) / len(loss_flex_list)
         mean_loss.backward()

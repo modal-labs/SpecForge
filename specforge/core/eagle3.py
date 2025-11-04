@@ -211,25 +211,19 @@ class OnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend == "sdpa":
-            attention_mask = self.draft_model.prepare_decoder_attention_mask(
-                attention_mask=attention_mask,
-                hidden_states=hidden_states,
-                batch_size=batch_size,
-                seq_length=seq_length,
-                past_key_values_length=past_key_values_length,
-            )
+        base_attention_mask = attention_mask
 
         # Step 5: run TTT
         plosses = []
         vlosses = []
         acces = []
         if self.attention_backend == "sdpa":
-            cache_hidden = [[], []]
-            past_key_values = None
+            cache_hidden = None
+            past_key_values = DynamicCache()
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
+        draft_use_cache = True
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
@@ -240,14 +234,27 @@ class OnlineEagle3Model(Eagle3Model):
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             # Step 5.2: run the draft model backbone
+            if self.attention_backend == "sdpa":
+                current_attn_mask = self.draft_model.prepare_decoder_attention_mask(
+                    attention_mask=base_attention_mask,
+                    hidden_states=hidden_states,
+                    batch_size=batch_size,
+                    seq_length=seq_length,
+                    past_key_values_length=past_key_values.get_seq_length()
+                    if past_key_values is not None
+                    else 0,
+                )
+            else:
+                current_attn_mask = base_attention_mask
+
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
                 hidden_states=hidden_states,
                 cache_hidden=cache_hidden,
-                attention_mask=attention_mask,
+                attention_mask=current_attn_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                use_cache=True,
+                use_cache=draft_use_cache,
             )
 
             # update hidden states for next step
@@ -276,6 +283,8 @@ class OnlineEagle3Model(Eagle3Model):
                 input_ids = padding(input_ids, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
+                if self.attention_backend == "sdpa":
+                    base_attention_mask = padding(base_attention_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
 
@@ -585,14 +594,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend == "sdpa":
-            attention_mask = self.draft_model.prepare_decoder_attention_mask(
-                attention_mask=attention_mask,
-                hidden_states=hidden_states,
-                batch_size=batch_size,
-                seq_length=seq_length,
-                past_key_values_length=past_key_values_length,
-            )
+        base_attention_mask = attention_mask
 
         # Step 5: run TTT
         plosses = []
@@ -604,6 +606,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
+        draft_use_cache = self.attention_backend == "flex_attention"
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
@@ -615,14 +618,25 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             # Step 5.2: run the draft model backbone
+            if self.attention_backend == "sdpa":
+                current_attn_mask = self.draft_model.prepare_decoder_attention_mask(
+                    attention_mask=base_attention_mask,
+                    hidden_states=hidden_states,
+                    batch_size=batch_size,
+                    seq_length=seq_length,
+                    past_key_values_length=0,
+                )
+            else:
+                current_attn_mask = base_attention_mask
+
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
                 hidden_states=hidden_states,
                 cache_hidden=cache_hidden,
-                attention_mask=attention_mask,
+                attention_mask=current_attn_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                use_cache=True,
+                use_cache=draft_use_cache,
             )
 
             # update hidden states for next step
@@ -651,6 +665,8 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 input_ids = padding(input_ids, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
+                if self.attention_backend == "sdpa":
+                    base_attention_mask = padding(base_attention_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
 

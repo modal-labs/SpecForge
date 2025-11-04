@@ -70,32 +70,42 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         batch_size: int,
         seq_length: int,
         past_key_values_length: int,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """
-        Prepare the attention mask of the draft model.
+        Prepare a key padding mask for the draft model.
+
+        Returns:
+            A boolean tensor of shape `(batch_size, seq_length + past_key_values_length)`
+            indicating valid (True) tokens, or `None` if no masking is required.
         """
-        # create causal mask
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        combined_attention_mask = None
-        if seq_length > 1:
-            combined_attention_mask = _make_causal_mask(
-                (batch_size, seq_length),
-                hidden_states.dtype,
+        total_length = seq_length + past_key_values_length
+
+        if attention_mask is None:
+            return torch.ones(
+                (batch_size, total_length),
+                dtype=torch.bool,
                 device=hidden_states.device,
-                past_key_values_length=past_key_values_length,
             )
 
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = _expand_mask(
-                attention_mask, hidden_states.dtype, tgt_len=seq_length
-            ).to(hidden_states.device)
-            combined_attention_mask = (
-                expanded_attn_mask
-                if combined_attention_mask is None
-                else expanded_attn_mask + combined_attention_mask
-            )
-        return combined_attention_mask
+        # Ensure boolean dtype and correct device
+        if attention_mask.dtype != torch.bool:
+            attention_mask = attention_mask.to(torch.bool)
+        attention_mask = attention_mask.to(hidden_states.device)
+
+        if attention_mask.size(1) == total_length:
+            return attention_mask
+
+        if attention_mask.size(1) > total_length:
+            return attention_mask[:, -total_length:]
+
+        # If the provided mask is shorter than expected, pad valid tokens on the left.
+        pad_length = total_length - attention_mask.size(1)
+        pad = torch.ones(
+            (batch_size, pad_length),
+            dtype=torch.bool,
+            device=attention_mask.device,
+        )
+        return torch.cat([pad, attention_mask], dim=1)
 
     @abstractmethod
     def backbone(
