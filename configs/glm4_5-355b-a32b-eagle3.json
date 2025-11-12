@@ -2,6 +2,14 @@
   "architectures": [
     "LlamaForCausalLMEagle3"
   ],
+  "eagle_config": {
+    "eagle_aux_hidden_state_layer_ids": [
+      1,
+      46,
+      89
+    ],
+    "use_aux_hidden_state": true
+  },
   "attention_bias": true,
   "attention_dropout": 0.0,
   "pad_token_id": 151329,
