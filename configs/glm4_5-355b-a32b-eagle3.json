@@ -2,6 +2,14 @@
   "architectures": [
     "LlamaForCausalLMEagle3"
   ],
+  "eagle_config": {
+    "eagle_aux_hidden_state_layer_ids": [
+      1,
+      46,
+      89
+    ],
+    "use_aux_hidden_state": true
+  },
   "attention_bias": true,
   "attention_dropout": 0.0,
   "pad_token_id": 151329,
@@ -33,6 +41,7 @@
   "num_key_value_heads": 8,
   "rms_norm_eps": 1e-05,
   "rope_scaling": null,
+  "rope_is_neox_style": true,
   "rope_theta": 1000000,
   "num_nextn_predict_layers": 1,
   "tie_word_embeddings": false,
