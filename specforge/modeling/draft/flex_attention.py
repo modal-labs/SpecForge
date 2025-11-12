@@ -34,19 +34,24 @@ class WrappedFlexAttention:
 
     @torch.compiler.disable(recursive=False)
     def __init__(self):
-        # Lazy compilation happens on first call per shape.
+        # Nothing to initialize eagerly – cache is populated on demand.
         pass
 
     def _get_compiled(
         self,
         compile_key: Tuple[str, torch.dtype, int, int, int, int],
-    ) -> Callable:
+    ):
         if compile_key in self._compiled_flex_attention:
+            # Move to the end to preserve LRU order
             self._compiled_flex_attention.move_to_end(compile_key)
             return self._compiled_flex_attention[compile_key]
 
-        compiled_fn = torch.compile(flex_attention, dynamic=True)
+        compiled_fn = torch.compile(
+            flex_attention,
+            dynamic=True,
+        )
         self._compiled_flex_attention[compile_key] = compiled_fn
+        # Trim cache if we exceed capacity
         if len(self._compiled_flex_attention) > self._cache_size:
             self._compiled_flex_attention.popitem(last=False)
         return compiled_fn
@@ -55,15 +60,18 @@ class WrappedFlexAttention:
         compile_key = (
             query.device.type,
             query.dtype,
-            query.shape[1],
-            key.shape[1],
-            query.shape[-2],
-            key.shape[-2],
+            query.shape[1],  # num attention heads
+            key.shape[1],  # num kv heads (for GQA)
+            query.shape[-2],  # query length
+            key.shape[-2],  # kv length
         )
         compiled_fn = self._get_compiled(compile_key)
         try:
             return compiled_fn(query, key, value, **kwargs)
         except RuntimeError as exc:
+            # Flex attention occasionally triggers CUDA illegal memory access when
+            # recompilation is required. In that case we fall back to eager mode and
+            # drop the cached compiled graph so it can be rebuilt safely.
             if "illegal memory" in str(exc).lower():
                 self._compiled_flex_attention.pop(compile_key, None)
                 return flex_attention(query, key, value, **kwargs)
@@ -108,11 +116,14 @@ class WrappedCreateBlockMask:
     def _get_compiled(
         self,
         compile_key: Tuple[str, int, int, int, int, str],
-    ) -> Callable:
+    ):
         if compile_key in self._compiled_create_block_mask:
             self._compiled_create_block_mask.move_to_end(compile_key)
             return self._compiled_create_block_mask[compile_key]
-        compiled_fn = torch.compile(create_block_mask, dynamic=True)
+        compiled_fn = torch.compile(
+            create_block_mask,
+            dynamic=True,
+        )
         self._compiled_create_block_mask[compile_key] = compiled_fn
         if len(self._compiled_create_block_mask) > self._cache_size:
             self._compiled_create_block_mask.popitem(last=False)
@@ -146,7 +157,12 @@ def compile_friendly_create_block_mask(
     KV_LEN,
     device,
 ):
-    if is_torchdynamo_compiling():
+    create_block_mask_compiled = (
+        WrappedCreateBlockMask()
+        if not is_torchdynamo_compiling()
+        else None
+    )
+    if create_block_mask_compiled is None:
         return create_block_mask(
             mask_mod,
             B,
@@ -155,14 +171,13 @@ def compile_friendly_create_block_mask(
             KV_LEN,
             device,
         )
-    create_block_mask_compiled = WrappedCreateBlockMask()
     return create_block_mask_compiled(
-        mask_mod,
-        B,
-        H,
-        Q_LEN,
-        KV_LEN,
-        device,
+        mask_mod=mask_mod,
+        B=B,
+        H=H,
+        Q_LEN=Q_LEN,
+        KV_LEN=KV_LEN,
+        device=device,
     )
 
 

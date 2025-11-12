@@ -682,8 +682,6 @@ class LlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        cache_hidden = None
-
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -698,179 +696,87 @@ class LlamaAttention(nn.Module):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
-        if cache_hidden is None:
-            past_seen_tokens = (
-                past_key_values.get_seq_length() if past_key_values is not None else 0
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+        lck = 0
+
+        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+            lck = past_seen_tokens // max(q_len, 1)
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self.config.rope_scaling["mrope_section"],
             )
-            lck = 0
-
-            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
-                lck = past_seen_tokens // max(q_len, 1)
-                cos, sin = self.rotary_emb(query_states, position_ids + lck)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_multimodal_rotary_pos_emb(
-                    query_states,
-                    key_states,
-                    cos,
-                    sin,
-                    self.config.rope_scaling["mrope_section"],
-                )
-            elif isinstance(self.rotary_emb, Glm4MoeRotaryEmbedding):
-                lck = past_seen_tokens // max(q_len, 1)
-                cos, sin = self.rotary_emb(query_states, position_ids + lck)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_neox_rotary_pos_emb(
-                    query_states,
-                    key_states,
-                    cos,
-                    sin,
-                )
-            else:
-                lck = past_seen_tokens
-                cos, sin = self.rotary_emb(
-                    query_states, seq_len=q_len + past_seen_tokens
-                )
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, position_ids + lck
-                )
-
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-            if past_key_values is not None and use_cache:
-                cache_position: torch.Tensor = torch.arange(
-                    past_seen_tokens,
-                    past_seen_tokens + q_len,
-                    device=hidden_states.device,
-                )
-                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                key_states, value_states = past_key_values.update(
-                    key_states,
-                    value_states,
-                    layer_idx=0,
-                    cache_kwargs=cache_kwargs,
-                )
-
-            kv_len = key_states.shape[-2]
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(torch.bool)
-                if attention_mask.shape[1] != kv_len:
-                    attention_mask = attention_mask[:, -kv_len:]
-                key_padding_mask = attention_mask.unsqueeze(1).unsqueeze(1)
-                query_keep_mask = attention_mask[:, -q_len:]
-            else:
-                key_padding_mask = None
-                query_keep_mask = None
-
-            sdp_ctx = (
-                torch.backends.cuda.sdp_kernel(
-                    enable_flash=True, enable_math=False, enable_mem_efficient=True
-                )
-                if query_states.is_cuda
-                else nullcontext()
+        elif isinstance(self.rotary_emb, Glm4MoeRotaryEmbedding):
+            lck = past_seen_tokens // max(q_len, 1)
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_neox_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
             )
-
-            with sdp_ctx:
-                attn_output = F.scaled_dot_product_attention(
-                    query_states,
-                    key_states,
-                    value_states,
-                    attn_mask=key_padding_mask,
-                    is_causal=True,
-                    dropout_p=0.0,
-                )
-
-            if query_keep_mask is not None:
-                attn_output = attn_output * query_keep_mask[:, None, :, None].to(
-                    attn_output.dtype
-                )
-
         else:
-            lck = len(cache_hidden[0])
-            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
-                cos, sin = self.rotary_emb(query_states, position_ids + lck)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_multimodal_rotary_pos_emb(
-                    query_states,
-                    key_states,
-                    cos,
-                    sin,
-                    self.config.rope_scaling["mrope_section"],
-                )
-            elif isinstance(self.rotary_emb, Glm4MoeRotaryEmbedding):
-                cos, sin = self.rotary_emb(query_states, position_ids + lck)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_neox_rotary_pos_emb(
-                    query_states,
-                    key_states,
-                    cos,
-                    sin,
-                )
-            else:
-                cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, position_ids
-                )
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + past_seen_tokens)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids + lck
+            )
 
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-            cache_hidden[0] = cache_hidden[0] + [key_states]
-            cache_hidden[1] = cache_hidden[1] + [value_states]
+        if past_key_values is not None and use_cache:
+            cache_position: torch.Tensor = torch.arange(
+                past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
+            )
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                layer_idx=0,
+                cache_kwargs=cache_kwargs,
+            )
 
-            cache_k = cache_hidden[0]
-            cache_v = cache_hidden[1]
+        kv_len = key_states.shape[-2]
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(torch.bool)
+            if attention_mask.shape[1] != kv_len:
+                attention_mask = attention_mask[:, -kv_len:]
+            key_padding_mask = (~attention_mask).unsqueeze(1).unsqueeze(1)
+            query_keep_mask = attention_mask[:, -q_len:]
+        else:
+            key_padding_mask = None
+            query_keep_mask = None
 
-            k0 = cache_k[0]
-            v0 = cache_v[0]
+        sdp_ctx = (
+            torch.backends.cuda.sdp_kernel(
+                enable_flash=True, enable_math=False, enable_mem_efficient=True
+            )
+            if query_states.is_cuda
+            else nullcontext()
+        )
 
-            if attention_mask is not None:
-                if attention_mask.dtype == torch.bool:
-                    current_mask = attention_mask[:, -q_len:]
-                    attention_mask_float = _expand_mask(
-                        current_mask, query_states.dtype, tgt_len=q_len
-                    ).to(query_states.device)
-                else:
-                    attention_mask_float = attention_mask
-            else:
-                attention_mask_float = _make_causal_mask(
-                    (bsz, q_len),
-                    query_states.dtype,
-                    device=query_states.device,
-                    past_key_values_length=0,
-                )
+        with sdp_ctx:
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=key_padding_mask,
+                is_causal=True,
+                dropout_p=0.0,
+            )
 
-            attn_weights = torch.matmul(
-                query_states, k0.transpose(2, 3)
-            ) / math.sqrt(self.head_dim)
-            lck = len(cache_k)
-
-            attn_weights = attn_weights + attention_mask_float
-
-            for i in range(1, lck):
-                ki = cache_k[i]
-                qi = query_states
-                kiq = ki
-
-                attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
-                attn_weights = torch.cat(
-                    (attn_weights, attn_weightsi[..., None]), dim=-1
-                )
-
-            attn_weights = nn.functional.softmax(
-                attn_weights, dim=-1, dtype=torch.float32
-            ).to(query_states.dtype)
-            attn_weights0 = attn_weights[..., :q_len]
-
-            attn_output = torch.matmul(attn_weights0, v0)
-
-            for i in range(1, lck):
-                vi = cache_v[i]
-                attn_weightsi = attn_weights[..., q_len + i - 1]
-                attn_outputi = attn_weightsi[..., None] * vi
-                attn_output = attn_output + attn_outputi
+        if query_keep_mask is not None:
+            attn_output = attn_output * query_keep_mask[:, None, :, None].to(
+                attn_output.dtype
+            )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)

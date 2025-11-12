@@ -46,8 +46,8 @@ def run_attention(
     batch_size = hidden_states_list[0].shape[0]
     # Initialize cache and attention function based on backend
     if attention_backend == "sdpa":
-        cache_hidden = None
-        past_key_values = DynamicCache()
+        cache_hidden = [[], []]
+        past_key_values = None
         attn_func = LlamaAttention(config).to(device).to(torch.bfloat16)
     elif attention_backend == "flex_attention":
         cache_hidden = None
@@ -89,18 +89,11 @@ def run_attention(
         hidden_states = hidden_states_list[idx]
         # Call attention function with appropriate parameters
         if attention_backend == "sdpa":
-            decoder_attention_mask = prepare_decoder_attention_mask(
-                attention_mask=attention_mask,
-                input_shape=(batch_size, seq_len),
-                inputs_embeds=input_embeds,
-                past_key_values_length=past_key_values.get_seq_length(),
-            )
             output = attn_func(
                 hidden_states=hidden_states,
                 attention_mask=decoder_attention_mask,
                 position_ids=position_ids,
                 cache_hidden=cache_hidden,
-                past_key_values=past_key_values,
                 output_attentions=False,
                 use_cache=True,
             )
