@@ -9,8 +9,14 @@ from sglang.srt.distributed import (
     get_world_group,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
-    set_symm_mem_all_reduce,
 )
+
+try:  # SGLang >= v0.5.5.post2
+    from sglang.srt.distributed import set_torch_symm_mem_all_reduce
+except ImportError:  # Backward compatibility with older releases
+    from sglang.srt.distributed import (
+        set_symm_mem_all_reduce as set_torch_symm_mem_all_reduce,
+    )
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -64,7 +70,6 @@ logger = logging.getLogger(__name__)
 
 
 class SGLangRunner(ModelRunner):
-
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 
@@ -108,7 +113,7 @@ class SGLangRunner(ModelRunner):
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
-        set_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
+        set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
 
         if not self.is_draft_worker:
             if self.device == "cpu":

@@ -124,13 +124,12 @@ class Eagle3TargetModel(ABC):
                 num_layers - 4,
             ]
         self.aux_hidden_states_layers = aux_hidden_states_layers
-        assert (
-            len(self.aux_hidden_states_layers) == 3
-        ), "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
+        assert len(self.aux_hidden_states_layers) == 3, (
+            "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
+        )
 
 
 class HFEagle3TargetModel(Eagle3TargetModel):
-
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
@@ -171,7 +170,6 @@ class HFEagle3TargetModel(Eagle3TargetModel):
 
 
 class SGLangEagle3TargetModel(Eagle3TargetModel):
-
     def __init__(self, model_runner: SGLangRunner):
         super().__init__()
         self.model_runner = model_runner
@@ -186,7 +184,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "SGLangEagle3TargetModel":
-        tp_size = dist.get_world_size(get_tp_group())
+        tp_group = get_tp_group()
+        tp_size = dist.get_world_size(tp_group)
+        tp_rank = dist.get_rank(tp_group)
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
@@ -199,14 +199,27 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             attention_backend="torch_native",
         )
         model_config = ModelConfig.from_server_args(server_args)
+
+        hf_config = model_config.hf_config
+        is_moe_model = bool(
+            getattr(hf_config, "n_routed_experts", 0)
+            or getattr(hf_config, "num_local_experts", 0)
+        )
+        if is_moe_model and tp_size > 1 and server_args.ep_size == 1:
+            server_args.ep_size = tp_size
+            model_config = ModelConfig.from_server_args(server_args)
+
+        moe_group_span = max(1, tp_size // server_args.ep_size)
+        moe_ep_rank = tp_rank // moe_group_span
+
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=0.4,
             gpu_id=torch.cuda.current_device(),
-            tp_rank=dist.get_rank(get_tp_group()),
+            tp_rank=tp_rank,
             tp_size=server_args.tp_size,
-            moe_ep_rank=0,
-            moe_ep_size=1,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
             pp_rank=0,
             pp_size=1,
             server_args=server_args,
@@ -429,7 +442,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
 
 class CustomEagle3TargetModel(Eagle3TargetModel):
-
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model

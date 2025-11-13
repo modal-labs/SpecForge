@@ -5,9 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
+from transformers import GenerationMixin, Glm4MoeConfig, LlamaConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from specforge.modeling.draft.flex_attention import (
@@ -631,11 +632,17 @@ class LlamaAttention(nn.Module):
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
-            self.rotary_emb = LlamaRotaryEmbedding(
-                self.head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                base=getattr(self.config, "rope_theta", 10000),
-            )
+            target_model_type = getattr(self.config, "taget_model_type", None)
+            if target_model_type == "glm4_moe":
+                self.rotary_emb = Glm4MoeRotaryEmbedding(
+                    config=self.config
+                )
+            else:
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
+                )
         else:
             rope_scaling = self.config.rope_scaling
 
@@ -744,6 +751,15 @@ class LlamaAttention(nn.Module):
                     sin,
                     self.config.rope_scaling["mrope_section"],
                 )
+            elif isinstance(self.rotary_emb, Glm4MoeRotaryEmbedding):
+                cos, sin = self.rotary_emb(query_states, position_ids)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_neox_rotary_pos_emb(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
+                )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
@@ -774,6 +790,15 @@ class LlamaAttention(nn.Module):
                     cos,
                     sin,
                     self.config.rope_scaling["mrope_section"],
+                )
+            elif isinstance(self.rotary_emb, Glm4MoeRotaryEmbedding):
+                cos, sin = self.rotary_emb(query_states, position_ids + lck)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_neox_rotary_pos_emb(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
                 )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
@@ -884,6 +909,15 @@ class LlamaFlexAttention(LlamaAttention):
                 cos,
                 sin,
                 self.config.rope_scaling["mrope_section"],
+            )
+        elif isinstance(self.rotary_emb, Glm4MoeRotaryEmbedding):
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_neox_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
             )
         else:
             cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
