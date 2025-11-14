@@ -2,8 +2,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Function
 
-from specforge.distributed import gather_tensor, get_tp_group, shard_tensor
+from specforge.distributed import get_tp_group, shard_tensor
 
 
 class RowParallelLinear(nn.Module):
@@ -178,3 +179,15 @@ class ColumnParallelLinear(nn.Module):
 
     def __repr__(self):
         return f"ColumnParallelLinear(in_features={self.in_features}, out_features={self.out_features_per_shard}, tp_size={self.tp_size}, tp_rank={self.tp_rank})"
+
+
+class _AllReduce(Function):
+    @staticmethod
+    def forward(ctx, input, op, group):
+        output = input.clone()
+        dist.all_reduce(output, op=op, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None, None

@@ -2,8 +2,8 @@ import math
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers import GenerationMixin, Glm4MoeConfig, LlamaConfig, PreTrainedModel
 from transformers.activations import ACT2FN
@@ -11,6 +11,8 @@ from transformers.cache_utils import Cache
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from specforge.distributed import get_tp_group
+from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear, _AllReduce
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
@@ -606,27 +608,58 @@ class LlamaAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.tp_group = get_tp_group()
+        if (
+            self.tp_group is not None
+            and dist.is_available()
+            and dist.is_initialized()
+        ):
+            self._tp_size = dist.get_world_size(self.tp_group)
+            self._tp_rank = dist.get_rank(self.tp_group)
+        else:
+            self.tp_group = None
+            self._tp_size = 1
+            self._tp_rank = 0
+
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         if hasattr(config, "head_dim"):
             self.head_dim = config.head_dim
         else:
             self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
+
+        total_num_heads = config.num_attention_heads
+        total_num_kv_heads = config.num_key_value_heads
+        if total_num_heads % self._tp_size != 0:
+            raise ValueError(
+                f"num_attention_heads ({total_num_heads}) must be divisible by tp_size ({self._tp_size})"
+            )
+        if total_num_kv_heads % self._tp_size != 0:
+            raise ValueError(
+                f"num_key_value_heads ({total_num_kv_heads}) must be divisible by tp_size ({self._tp_size})"
+            )
+
+        self.num_heads = total_num_heads // self._tp_size
+        self.num_key_value_heads = total_num_kv_heads // self._tp_size
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
-        self.q_proj = nn.Linear(
-            self.hidden_size * 2, self.num_heads * self.head_dim, bias=False
+        column_linear_cls = (
+            ColumnParallelLinear if self._tp_size > 1 else nn.Linear
         )
-        self.k_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+        row_linear_cls = RowParallelLinear if self._tp_size > 1 else nn.Linear
+
+        self.q_proj = column_linear_cls(
+            self.hidden_size * 2, total_num_heads * self.head_dim, bias=False
         )
-        self.v_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+        self.k_proj = column_linear_cls(
+            self.hidden_size * 2, total_num_kv_heads * self.head_dim, bias=False
         )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        self.v_proj = column_linear_cls(
+            self.hidden_size * 2, total_num_kv_heads * self.head_dim, bias=False
+        )
+        self.o_proj = row_linear_cls(
+            total_num_heads * self.head_dim, self.hidden_size, bias=False
         )
         self._init_rope()
 
@@ -855,6 +888,10 @@ class LlamaAttention(nn.Module):
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
 
         attn_output = self.o_proj(attn_output)
+        if self._tp_size > 1:
+            attn_output = _AllReduce.apply(
+                attn_output, dist.ReduceOp.SUM, self.tp_group
+            )
 
         return attn_output
 
@@ -975,6 +1012,10 @@ class LlamaFlexAttention(LlamaAttention):
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
         attn_output = self.o_proj(attn_output)
+        if self._tp_size > 1:
+            attn_output = _AllReduce.apply(
+                attn_output, dist.ReduceOp.SUM, self.tp_group
+            )
         return attn_output
 
 
@@ -984,41 +1025,41 @@ class LlamaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+        self.tp_group = get_tp_group()
+        if (
+            self.tp_group is not None
+            and dist.is_available()
+            and dist.is_initialized()
+        ):
+            self._tp_size = dist.get_world_size(self.tp_group)
+        else:
+            self.tp_group = None
+            self._tp_size = 1
+
+        column_linear_cls = (
+            ColumnParallelLinear if self._tp_size > 1 else nn.Linear
+        )
+        row_linear_cls = RowParallelLinear if self._tp_size > 1 else nn.Linear
+
+        self.gate_proj = column_linear_cls(
+            self.hidden_size, self.intermediate_size, bias=False
+        )
+        self.up_proj = column_linear_cls(
+            self.hidden_size, self.intermediate_size, bias=False
+        )
+        self.down_proj = row_linear_cls(
+            self.intermediate_size, self.hidden_size, bias=False
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
+        gate_output = self.gate_proj(x)
+        up_output = self.up_proj(x)
+        down_proj = self.down_proj(self.act_fn(gate_output) * up_output)
 
-            gate_proj = torch.cat(
-                [
-                    F.linear(x, gate_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-            up_proj = torch.cat(
-                [
-                    F.linear(x, up_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        if self._tp_size > 1:
+            down_proj = _AllReduce.apply(down_proj, dist.ReduceOp.SUM, self.tp_group)
 
         return down_proj
 

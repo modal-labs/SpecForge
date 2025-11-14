@@ -552,6 +552,11 @@ def main():
                 if "draft_model." in k and "embed" not in k.lower()
             }
 
+            draft_model.save_pretrained(
+                epoch_output_dir,
+                state_dict=draft_model_state_dict,
+            )
+
             if dist.get_rank() == 0:
                 torch.save(
                     state_to_save,
@@ -559,10 +564,6 @@ def main():
                 )
                 print_on_rank0(
                     f"Saved full training state to {epoch_output_dir}/training_state.pt"
-                )
-                draft_model.save_pretrained(
-                    epoch_output_dir,
-                    state_dict=draft_model_state_dict,
                 )
                 print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
             dist.barrier()
