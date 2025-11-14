@@ -829,17 +829,48 @@ class LlamaAttention(nn.Module):
             )
 
         kv_len = key_states.shape[-2]
-        if attention_mask is not None:
+        batch_size = query_states.shape[0]
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, kv_len), dtype=torch.bool, device=query_states.device
+            )
+        else:
             attention_mask = attention_mask.to(torch.bool)
             if attention_mask.shape[1] != kv_len:
                 attention_mask = attention_mask[:, -kv_len:]
-            key_padding_mask_bool = (~attention_mask).unsqueeze(1).unsqueeze(1)
-            min_value = torch.finfo(query_states.dtype).min
-            key_padding_mask = key_padding_mask_bool.to(query_states.dtype) * min_value
-            query_keep_mask = attention_mask[:, -q_len:]
-        else:
-            key_padding_mask = None
-            query_keep_mask = None
+
+        query_keep_mask = attention_mask[:, -q_len:]
+
+        current_mask = query_keep_mask
+        seq_lengths = current_mask.sum(dim=-1)
+        lck = past_seen_tokens // max(q_len, 1)
+        if lck > 0:
+            seq_lengths = torch.clamp(seq_lengths - lck, min=0)
+
+        kv_ids = torch.arange(kv_len, device=query_states.device).view(1, 1, kv_len)
+        q_ids = torch.arange(q_len, device=query_states.device).view(1, q_len, 1)
+        seq = seq_lengths.view(batch_size, 1, 1)
+
+        causal_mask = (q_ids >= kv_ids) & (kv_ids < seq) & (q_ids < seq)
+        kv_mod = torch.remainder(kv_ids, q_len)
+        suffix_mask = (
+            (kv_ids >= q_len)
+            & (kv_mod < seq)
+            & (torch.remainder(kv_ids - q_ids, q_len) == 0)
+        )
+        allowed = (causal_mask | suffix_mask).unsqueeze(1)
+
+        valid_keys = attention_mask[:, None, None, :]
+        allowed = allowed & valid_keys
+
+        mask_value = torch.finfo(query_states.dtype).min
+        attn_mask = torch.full(
+            (batch_size, 1, q_len, kv_len),
+            mask_value,
+            dtype=query_states.dtype,
+            device=query_states.device,
+        )
+        attn_mask = attn_mask.masked_fill(allowed, 0.0)
 
         sdp_ctx = (
             torch.backends.cuda.sdp_kernel(
@@ -854,8 +885,8 @@ class LlamaAttention(nn.Module):
                 query_states,
                 key_states,
                 value_states,
-                attn_mask=key_padding_mask,
-                is_causal=True,
+                attn_mask=attn_mask,
+                is_causal=False,
                 dropout_p=0.0,
             )
 
