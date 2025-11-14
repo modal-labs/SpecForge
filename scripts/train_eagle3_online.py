@@ -563,6 +563,11 @@ def main():
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     sanity_check(args)
+    tp_group = get_tp_group()
+    dp_group = get_dp_group()
+    print(f"Distributed setup -> world_size={dist.get_world_size()}")
+    print(f"tp_size={dist.get_world_size(tp_group)}")
+    print(f"dp_size={dist.get_world_size(dp_group)}")
     print_with_rank("Initialized distributed environment")
 
     # ================================================
