@@ -46,11 +46,9 @@ def run_attention(
     batch_size = hidden_states_list[0].shape[0]
     # Initialize cache and attention function based on backend
     if attention_backend == "sdpa":
-        cache_hidden = [[], []]
-        past_key_values = None
+        past_key_values = DynamicCache()
         attn_func = LlamaAttention(config).to(device).to(torch.bfloat16)
     elif attention_backend == "flex_attention":
-        cache_hidden = None
         past_key_values = DynamicCache()
         attn_func = LlamaFlexAttention(config).to(device).to(torch.bfloat16)
     else:
@@ -59,13 +57,8 @@ def run_attention(
     # Simulate inputs - move to device
     position_ids = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
     input_embeds = torch.randn(batch_size, seq_len, config.hidden_size).to(device)
-    attention_mask = torch.ones(batch_size, seq_len).to(device)
-    decoder_attention_mask = prepare_decoder_attention_mask(
-        attention_mask=attention_mask,
-        input_shape=(batch_size, seq_len),
-        inputs_embeds=input_embeds,
-        past_key_values_length=0,
-    )
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool).to(device)
+    base_attention_mask = attention_mask.clone()
 
     loss_list = []
 
@@ -89,18 +82,24 @@ def run_attention(
         hidden_states = hidden_states_list[idx]
         # Call attention function with appropriate parameters
         if attention_backend == "sdpa":
+            decoder_attention_mask = prepare_decoder_attention_mask(
+                attention_mask=base_attention_mask,
+                input_shape=(batch_size, seq_len),
+                inputs_embeds=input_embeds,
+                past_key_values_length=past_key_values.get_seq_length(),
+            )
             output = attn_func(
                 hidden_states=hidden_states,
                 attention_mask=decoder_attention_mask,
                 position_ids=position_ids,
-                cache_hidden=cache_hidden,
+                past_key_values=past_key_values,
                 output_attentions=False,
                 use_cache=True,
             )
         else:  # flex_attention
             output = attn_func(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=base_attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 output_attentions=False,
@@ -110,6 +109,9 @@ def run_attention(
         # Compute a simple loss for benchmarking
         loss = output[0].sum()
         loss_list.append(loss)
+
+        if attention_backend == "sdpa" and not is_last:
+            base_attention_mask = padding(base_attention_mask, left=False)
 
     # Compute mean loss and backward pass
     if loss_list:

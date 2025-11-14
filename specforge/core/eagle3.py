@@ -84,7 +84,7 @@ class OnlineEagle3Model(Eagle3Model):
             input_ids: (batch, seq_len)
             attention_mask: (batch, seq_len)
             loss_mask: (batch, seq_len)
-            past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
+            past_key_values: Optional cache. SDPA-based draft models now populate this DynamicCache so TTT steps reuse accumulated KV history, while flex attention continues to manage caching inside the attention module.
             position_ids: (batch, seq_len)
         """
         # Step 1: handle vocab size

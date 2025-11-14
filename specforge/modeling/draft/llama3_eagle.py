@@ -833,7 +833,9 @@ class LlamaAttention(nn.Module):
             attention_mask = attention_mask.to(torch.bool)
             if attention_mask.shape[1] != kv_len:
                 attention_mask = attention_mask[:, -kv_len:]
-            key_padding_mask = (~attention_mask).unsqueeze(1).unsqueeze(1)
+            key_padding_mask_bool = (~attention_mask).unsqueeze(1).unsqueeze(1)
+            min_value = torch.finfo(query_states.dtype).min
+            key_padding_mask = key_padding_mask_bool.to(query_states.dtype) * min_value
             query_keep_mask = attention_mask[:, -q_len:]
         else:
             key_padding_mask = None
@@ -1264,5 +1266,5 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids=position_ids,
             past_key_values=past_key_values,
             output_attentions=False,
-            use_cache=False,
+            use_cache=use_cache,
         )
