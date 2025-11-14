@@ -17,7 +17,11 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
-from specforge.distributed import get_tp_device_mesh, get_tp_group
+from specforge.distributed import (
+    SequenceShardMetadata,
+    get_tp_device_mesh,
+    get_tp_group,
+)
 from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
@@ -32,6 +36,7 @@ class Eagle3TargetOutput:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     last_hidden_states: Optional[torch.Tensor] = None
+    sequence_metadata: Optional[SequenceShardMetadata] = None
 
 
 class Eagle3TargetModel(ABC):

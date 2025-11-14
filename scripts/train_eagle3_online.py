@@ -30,6 +30,7 @@ from specforge.data import (
     prepare_dp_dataloaders,
 )
 from specforge.distributed import (
+    SequenceParallelCoordinator,
     destroy_distributed,
     get_dp_group,
     get_tp_group,
@@ -111,6 +112,11 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--draft-accumulation-steps", type=int, default=1)
+    parser.add_argument(
+        "--sequence-parallel",
+        action="store_true",
+        help="Shard sequences across TP ranks instead of the batch dimension.",
+    )
 
     # other args
     parser.add_argument("--cache-key", type=str, default=None)
@@ -298,7 +304,27 @@ def sanity_check(args: Namespace) -> None:
         None
     """
     args.dp_size = dist.get_world_size() // args.tp_size
-    args.target_batch_size = args.tp_size * args.batch_size
+    # Reinterpret user batch-size as the per-DP-rank micro batch so TP does not
+    # implicitly scale dataset consumption.
+    args.micro_batch_size = args.batch_size
+    args.global_batch_size = args.micro_batch_size * args.dp_size
+    args.target_batch_size = args.micro_batch_size
+
+    args.sequence_parallel = bool(args.sequence_parallel and args.tp_size > 1)
+    if args.sequence_parallel:
+        if args.dp_size != 1:
+            raise ValueError("Sequence parallelism currently requires dp_size == 1")
+        if args.micro_batch_size != 1:
+            raise ValueError(
+                "Sequence parallelism currently requires --batch-size (micro batch) == 1"
+            )
+        if args.is_vlm:
+            raise ValueError("Sequence parallelism is not yet implemented for VLM training")
+        if args.attention_backend != "sdpa":
+            raise ValueError(
+                "Sequence parallelism currently requires --attention-backend sdpa"
+            )
+        print_with_rank("Sequence parallelism enabled across TP ranks")
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
@@ -377,7 +403,7 @@ def build_dataloaders(
         )
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
-        args.target_batch_size,
+        args.micro_batch_size,
         num_workers=4,
         shuffle=True,
         process_group=get_dp_group(),
@@ -398,7 +424,7 @@ def build_dataloaders(
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
-            args.target_batch_size,
+            args.micro_batch_size,
             num_workers=4,
             shuffle=False,
             process_group=get_dp_group(),
@@ -457,6 +483,30 @@ def save_checkpoints(
         dist.barrier()
 
 
+def _use_sequence_parallel(args: Namespace) -> bool:
+    return bool(getattr(args, "sequence_parallel", False))
+
+
+def _shard_eagle3_data_along_sequence(eagle3_data) -> None:
+    seq_len = eagle3_data.input_ids.shape[1]
+    coordinator = SequenceParallelCoordinator(seq_dim=1)
+    metadata = coordinator.build_metadata(seq_len)
+
+    for field in [
+        "input_ids",
+        "attention_mask",
+        "loss_mask",
+        "target",
+        "hidden_states",
+    ]:
+        tensor = getattr(eagle3_data, field, None)
+        if tensor is None:
+            continue
+        setattr(eagle3_data, field, coordinator.shard(tensor, metadata))
+
+    eagle3_data.sequence_metadata = metadata
+
+
 def run_forward(
     args: Namespace,
     eagle3_model: nn.Module,
@@ -478,13 +528,18 @@ def run_forward(
             loss_mask=data["loss_mask"].cuda(),
         )
 
-        eagle3_data.input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
-        eagle3_data.attention_mask = get_dp_data_shard_from_tp(
-            eagle3_data.attention_mask
-        )
-        eagle3_data.loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
-        eagle3_data.target = get_dp_data_shard_from_tp(eagle3_data.target)
-        eagle3_data.hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+        if _use_sequence_parallel(args):
+            _shard_eagle3_data_along_sequence(eagle3_data)
+        else:
+            eagle3_data.input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
+            eagle3_data.attention_mask = get_dp_data_shard_from_tp(
+                eagle3_data.attention_mask
+            )
+            eagle3_data.loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
+            eagle3_data.target = get_dp_data_shard_from_tp(eagle3_data.target)
+            eagle3_data.hidden_states = get_dp_data_shard_from_tp(
+                eagle3_data.hidden_states
+            )
 
         plosses, _, acces = eagle3_model(
             input_ids=eagle3_data.input_ids,
@@ -492,6 +547,7 @@ def run_forward(
             loss_mask=eagle3_data.loss_mask,
             target=eagle3_data.target,
             hidden_states=eagle3_data.hidden_states,
+            sequence_metadata=getattr(eagle3_data, "sequence_metadata", None),
         )
     return plosses, acces
 

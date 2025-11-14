@@ -25,10 +25,12 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers.cache_utils import DynamicCache
 
 from specforge.core.loss import LogSoftmaxLoss
+from specforge.distributed import SequenceShardMetadata, get_tp_group
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -75,6 +77,7 @@ class OnlineEagle3Model(Eagle3Model):
         hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
+        sequence_metadata: Optional[SequenceShardMetadata] = None,
         **kwargs,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
@@ -98,6 +101,8 @@ class OnlineEagle3Model(Eagle3Model):
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
+        sp_enabled = sequence_metadata is not None
+        tp_group = get_tp_group() if sp_enabled else None
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
@@ -135,10 +140,13 @@ class OnlineEagle3Model(Eagle3Model):
         acces = []
         if self.attention_backend == "sdpa":
             cache_hidden = None
-            past_key_values = DynamicCache()
+            past_key_values = None if sp_enabled else DynamicCache()
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
+        else:
+            raise ValueError(f"Unsupported attention backend {self.attention_backend}")
+        use_cache = not sp_enabled
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
@@ -169,7 +177,8 @@ class OnlineEagle3Model(Eagle3Model):
                 attention_mask=current_attn_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                use_cache=True,
+                use_cache=use_cache,
+                sequence_metadata=sequence_metadata,
             )
 
             # update hidden states for next step
@@ -180,17 +189,31 @@ class OnlineEagle3Model(Eagle3Model):
 
             # Step 5.5: record metrics first as we in-place modify logits
             with torch.no_grad():
-                acces.append(
-                    _compute_metric_acc(
+                if sequence_metadata is not None:
+                    local_correct = (
+                        (logits.argmax(-1) == target_p.argmax(-1))
+                        * position_mask.squeeze(-1)
+                    ).sum()
+                    local_total = loss_mask.sum().clamp_min(1e-6)
+                    dist.all_reduce(local_correct, op=dist.ReduceOp.SUM, group=tp_group)
+                    dist.all_reduce(local_total, op=dist.ReduceOp.SUM, group=tp_group)
+                    acc_value = (local_correct / local_total.clamp_min(1e-6)).detach()
+                else:
+                    acc_value = _compute_metric_acc(
                         logits=logits,
                         target_p=target_p,
                         position_mask=position_mask,
                         loss_mask=loss_mask,
                     )
-                )
+                acces.append(acc_value)
 
             # Step 5.6: calculate loss, in-place modifies logits!
             loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            if sequence_metadata is not None:
+                length_scale = loss_mask.shape[1] / max(
+                    sequence_metadata.global_length, 1
+                )
+                loss = loss * length_scale
             plosses.append(loss)
 
             if not is_last:

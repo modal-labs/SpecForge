@@ -34,7 +34,7 @@ from safetensors import safe_open
 from transformers.cache_utils import Cache
 from transformers.modeling_utils import PreTrainedModel
 
-from specforge.distributed import get_tp_group
+from specforge.distributed import SequenceShardMetadata, get_tp_group
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
 
@@ -118,6 +118,7 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         position_ids: torch.Tensor,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
+        sequence_metadata: Optional[SequenceShardMetadata] = None,
     ) -> torch.Tensor:
         """
         The backbone of the draft model.

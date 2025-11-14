@@ -1,4 +1,6 @@
+from dataclasses import dataclass
 from datetime import timedelta
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
@@ -10,6 +12,19 @@ _TP_DEVICE_MESH = None
 _TP_GROUP = None
 _DP_DEVICE_MESH = None
 _DP_GROUP = None
+
+
+@dataclass
+class SequenceShardMetadata:
+    global_length: int
+    shard_start: int
+    shard_end: int
+    tp_rank: int
+    tp_size: int
+
+    @property
+    def local_length(self) -> int:
+        return max(self.shard_end - self.shard_start, 0)
 
 
 def get_tp_group():
@@ -92,6 +107,122 @@ def gather_tensor(
     dist.all_gather(obj_list, tensor, group=process_group)
     gather_tensor = torch.cat(obj_list, dim=dim)
     return gather_tensor
+
+
+def _compute_sequence_shard_bounds(
+    seq_len: int, tp_size: int, tp_rank: int
+) -> (int, int):
+    base = seq_len // tp_size
+    remainder = seq_len % tp_size
+    shard_start = tp_rank * base + min(tp_rank, remainder)
+    shard_length = base + (1 if tp_rank < remainder else 0)
+    shard_end = shard_start + shard_length
+    return shard_start, shard_end
+
+
+def compute_sequence_shard_metadata(
+    seq_len: int, process_group: Optional[dist.ProcessGroup] = None
+) -> SequenceShardMetadata:
+    process_group = process_group or get_tp_group()
+    tp_size = dist.get_world_size(process_group)
+    tp_rank = dist.get_rank(process_group)
+    shard_start, shard_end = _compute_sequence_shard_bounds(seq_len, tp_size, tp_rank)
+    return SequenceShardMetadata(
+        global_length=seq_len,
+        shard_start=shard_start,
+        shard_end=shard_end,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
+
+
+def shard_sequence_tensor(
+    tensor: torch.Tensor,
+    metadata: SequenceShardMetadata,
+    dim: int = 1,
+) -> torch.Tensor:
+    if tensor.size(dim) != metadata.global_length:
+        raise ValueError(
+            "Tensor sequence dimension does not match metadata."
+            f" Expected {metadata.global_length}, got {tensor.size(dim)}"
+        )
+
+    if metadata.local_length == metadata.global_length:
+        return tensor
+
+    slicer = [slice(None)] * tensor.ndim
+    slicer[dim] = slice(metadata.shard_start, metadata.shard_end)
+    return tensor[tuple(slicer)].contiguous()
+
+
+def gather_sequence_tensor(
+    tensor: torch.Tensor,
+    metadata: SequenceShardMetadata,
+    dim: int = 1,
+    process_group: Optional[dist.ProcessGroup] = None,
+) -> torch.Tensor:
+    process_group = process_group or get_tp_group()
+    tp_size = dist.get_world_size(process_group)
+
+    local_length = torch.tensor(
+        [metadata.local_length], device=tensor.device, dtype=torch.long
+    )
+    gathered_lengths = [torch.zeros_like(local_length) for _ in range(tp_size)]
+    dist.all_gather(gathered_lengths, local_length, group=process_group)
+    shard_lengths = [int(length.item()) for length in gathered_lengths]
+    max_length = max(shard_lengths) if shard_lengths else 0
+
+    padded = tensor.contiguous()
+    if metadata.local_length < max_length:
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = max_length - metadata.local_length
+        padded = torch.cat([padded, tensor.new_zeros(pad_shape)], dim=dim)
+
+    gather_list = [torch.empty_like(padded) for _ in range(tp_size)]
+    dist.all_gather(gather_list, padded, group=process_group)
+
+    collected: List[torch.Tensor] = []
+    for chunk, length in zip(gather_list, shard_lengths):
+        if length == 0:
+            continue
+        slicer = [slice(None)] * chunk.ndim
+        slicer[dim] = slice(0, length)
+        collected.append(chunk[tuple(slicer)])
+
+    if not collected:
+        output_shape = list(tensor.shape)
+        output_shape[dim] = 0
+        return tensor.new_zeros(output_shape)
+
+    gathered = torch.cat(collected, dim=dim)
+    total_length = sum(shard_lengths)
+    if metadata.global_length >= 0 and total_length != metadata.global_length:
+        raise RuntimeError(
+            "Sequence gather produced mismatched length: "
+            f"{total_length} vs expected {metadata.global_length}"
+        )
+    return gathered
+
+
+class SequenceParallelCoordinator:
+    def __init__(
+        self,
+        seq_dim: int = 1,
+        process_group: Optional[dist.ProcessGroup] = None,
+    ) -> None:
+        self.seq_dim = seq_dim
+        self.process_group = process_group or get_tp_group()
+
+    def build_metadata(self, seq_len: int) -> SequenceShardMetadata:
+        return compute_sequence_shard_metadata(seq_len, self.process_group)
+
+    def shard(self, tensor: torch.Tensor, metadata: SequenceShardMetadata) -> torch.Tensor:
+        return shard_sequence_tensor(tensor, metadata, dim=self.seq_dim)
+
+    def gather(self, tensor: torch.Tensor, metadata: SequenceShardMetadata) -> torch.Tensor:
+        return gather_sequence_tensor(
+            tensor, metadata, dim=self.seq_dim, process_group=self.process_group
+        )
 
 
 def is_tp_rank_0():

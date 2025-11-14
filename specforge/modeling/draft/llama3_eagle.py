@@ -13,7 +13,11 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from specforge.distributed import get_tp_group
+from specforge.distributed import (
+    SequenceParallelCoordinator,
+    SequenceShardMetadata,
+    get_tp_group,
+)
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear, _AllReduce
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
@@ -762,8 +766,10 @@ class LlamaAttention(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        sequence_metadata: Optional[SequenceShardMetadata] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
+        sp_enabled = sequence_metadata is not None
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
@@ -780,7 +786,9 @@ class LlamaAttention(nn.Module):
         ).transpose(1, 2)
 
         past_seen_tokens = (
-            past_key_values.get_seq_length() if past_key_values is not None else 0
+            sequence_metadata.shard_start
+            if sp_enabled and past_key_values is None
+            else (past_key_values.get_seq_length() if past_key_values is not None else 0)
         )
         lck = 0
 
@@ -816,6 +824,11 @@ class LlamaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        if sp_enabled:
+            seq_coord = SequenceParallelCoordinator(seq_dim=2)
+            key_states = seq_coord.gather(key_states, sequence_metadata)
+            value_states = seq_coord.gather(value_states, sequence_metadata)
+
         if past_key_values is not None and use_cache:
             cache_position: torch.Tensor = torch.arange(
                 past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
@@ -830,25 +843,41 @@ class LlamaAttention(nn.Module):
 
         kv_len = key_states.shape[-2]
         batch_size = query_states.shape[0]
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, kv_len), dtype=torch.bool, device=query_states.device
-            )
+
+        if sp_enabled:
+            if attention_mask is None:
+                raise ValueError(
+                    "Sequence parallelism requires attention masks to be provided"
+                )
+            local_mask = attention_mask.to(torch.bool)
+            if local_mask.shape[1] != q_len:
+                raise ValueError(
+                    "Sequence parallel attention masks must match the local shard length"
+                )
+            mask_coord = SequenceParallelCoordinator(seq_dim=1)
+            gathered_mask = mask_coord.gather(local_mask, sequence_metadata)
+            query_keep_mask = local_mask
+            key_keep_mask = gathered_mask
         else:
-            attention_mask = attention_mask.to(torch.bool)
-            if attention_mask.shape[1] != kv_len:
-                attention_mask = attention_mask[:, -kv_len:]
+            if attention_mask is None:
+                key_keep_mask = torch.ones(
+                    (batch_size, kv_len), dtype=torch.bool, device=query_states.device
+                )
+            else:
+                key_keep_mask = attention_mask.to(torch.bool)
+                if key_keep_mask.shape[1] != kv_len:
+                    key_keep_mask = key_keep_mask[:, -kv_len:]
+            query_keep_mask = key_keep_mask[:, -q_len:]
 
-        query_keep_mask = attention_mask[:, -q_len:]
-
-        current_mask = query_keep_mask
-        seq_lengths = current_mask.sum(dim=-1)
+        seq_lengths = query_keep_mask.sum(dim=-1)
         lck = past_seen_tokens // max(q_len, 1)
         if lck > 0:
             seq_lengths = torch.clamp(seq_lengths - lck, min=0)
 
         kv_ids = torch.arange(kv_len, device=query_states.device).view(1, 1, kv_len)
         q_ids = torch.arange(q_len, device=query_states.device).view(1, q_len, 1)
+        if sp_enabled:
+            q_ids = q_ids + sequence_metadata.shard_start
         seq = seq_lengths.view(batch_size, 1, 1)
 
         causal_mask = (q_ids >= kv_ids) & (kv_ids < seq) & (q_ids < seq)
@@ -860,7 +889,7 @@ class LlamaAttention(nn.Module):
         )
         allowed = (causal_mask | suffix_mask).unsqueeze(1)
 
-        valid_keys = attention_mask[:, None, None, :]
+        valid_keys = key_keep_mask[:, None, None, :]
         allowed = allowed & valid_keys
 
         mask_value = torch.finfo(query_states.dtype).min
@@ -926,7 +955,12 @@ class LlamaFlexAttention(LlamaAttention):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        sequence_metadata: Optional[SequenceShardMetadata] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if sequence_metadata is not None:
+            raise NotImplementedError(
+                "Sequence parallelism is not supported with flex attention"
+            )
         bsz, q_len, _ = hidden_states.size()
 
         past_seen_tokens = (
@@ -1126,6 +1160,7 @@ class LlamaDecoderLayer(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        sequence_metadata: Optional[SequenceShardMetadata] = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -1158,6 +1193,7 @@ class LlamaDecoderLayer(nn.Module):
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            sequence_metadata=sequence_metadata,
         )
         hidden_states = residual + hidden_states
 
@@ -1288,6 +1324,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         position_ids: torch.Tensor,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
+        sequence_metadata: Optional[SequenceShardMetadata] = None,
     ) -> torch.Tensor:
         return self.midlayer(
             input_emb=input_embeds,
@@ -1298,4 +1335,5 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             past_key_values=past_key_values,
             output_attentions=False,
             use_cache=use_cache,
+            sequence_metadata=sequence_metadata,
         )
