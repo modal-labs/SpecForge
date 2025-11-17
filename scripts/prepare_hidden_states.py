@@ -405,11 +405,15 @@ class HiddenStatesGenerator:
                 k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
             }
 
-            _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(
-                **filtered_batch_gpu,
-                return_last_hidden_states=True,
-                return_logits=False,
-            )
+            if num_valid > 0:
+                _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(
+                    **filtered_batch_gpu,
+                    return_last_hidden_states=True,
+                    return_logits=False,
+                )
+            else:
+                aux_hidden_states_list = []
+                last_hidden_states_list = []
 
             del filtered_batch_gpu
 
