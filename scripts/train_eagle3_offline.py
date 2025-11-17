@@ -204,6 +204,9 @@ def main():
         f"draft_accumulation_steps={args.draft_global_batch_size} // {args.dp_size} // {args.draft_micro_batch_size}={args.draft_accumulation_steps}"
     )
 
+    if args.cp_size > 1:
+        assert args.draft_attention_backend == "sdpa", "sdpa is the only supported attention backend with context parallel"
+
     # Validate report backend arguments
     tracker_class = get_tracker_class(args.report_to)
     if tracker_class:
@@ -405,33 +408,52 @@ def main():
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
 
-            # if batch_index % args.draft_accumulation_steps == 0:
-            #     optimizer.zero_grad()
-            plosses, _, acces = eagle3_model(
-                input_ids=data["input_ids"].cuda(),  # [B, S]
-                attention_mask=data["attention_mask"].cuda(),  # [B, S]
-                loss_mask=data["loss_mask"]
-                .unsqueeze(-1)
-                .cuda(),  # [B, S, 1] This is different from the online version
-                hidden_states=data["hidden_state"].cuda(),  # [B, S, D]
-                target=data["target"].cuda(),  # [B, S, D*3]
-            )
-            acces = torch.stack(acces).cpu().tolist()
+            from torch.distributed.tensor.experimental import context_parallel
+            from specforge.distributed import get_cp_device_mesh
 
-            # calculate weighted loss
-            ploss_weight = [0.8**i for i in range(len(plosses))]
-            ploss = (
-                sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
-                / args.draft_accumulation_steps
-            )
-            ploss.backward()
-            log_dict["train/lr"] = optimizer.get_learning_rate()
-            for i in range(len(plosses)):
-                log_dict[f"train/ploss_{i}"] += (
-                    plosses[i].item() / args.draft_accumulation_steps
+            input_ids = data["input_ids"].cuda()
+            attention_mask = data["attention_mask"].cuda()
+            loss_mask = data["loss_mask"].unsqueeze(-1).cuda()
+            hidden_states = data["hidden_state"].cuda()
+            target = data["target"].cuda()
+
+            if args.cp_size > 1:
+                context_parallel_ctx = context_parallel(
+                    mesh=get_cp_device_mesh(),
+                    buffers=[input_ids, attention_mask, loss_mask, hidden_states, target],
+                    buffer_seq_dims=[1, 1, 1, 1, 1],
+                    no_restore_buffers={input_ids, attention_mask, loss_mask, hidden_states, target},
                 )
-            for i in range(len(acces)):
-                log_dict[f"train/acc_{i}"] += acces[i] / args.draft_accumulation_steps
+            else:
+                context_parallel_ctx = None
+
+            with context_parallel_ctx:
+                # if batch_index % args.draft_accumulation_steps == 0:
+                #     optimizer.zero_grad()
+                plosses, _, acces = eagle3_model(
+                    input_ids=input_ids,  # [B, S]
+                    attention_mask=attention_mask,  # [B, S]
+                    loss_mask=loss_mask,  # [B, S, 1] This is different from the online version
+                    hidden_states=hidden_states,  # [B, S, D]
+                    target=target,  # [B, S, D*3]
+                )
+                acces = torch.stack(acces).cpu().tolist()
+
+                # calculate weighted loss
+                ploss_weight = [0.8**i for i in range(len(plosses))]
+                ploss = (
+                    sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
+                    / args.draft_accumulation_steps
+                )
+                ploss.backward()
+                log_dict["train/lr"] = optimizer.get_learning_rate()
+                for i in range(len(plosses)):
+                    log_dict[f"train/ploss_{i}"] += (
+                        plosses[i].item() / args.draft_accumulation_steps
+                    )
+                for i in range(len(acces)):
+                    log_dict[f"train/acc_{i}"] += acces[i] / args.draft_accumulation_steps
+
             if batch_index % args.draft_accumulation_steps == 0:
                 optimizer.step()
                 global_step += 1

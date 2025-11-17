@@ -690,37 +690,31 @@ class LlamaAttention(nn.Module):
             k0 = cache_k[0]
             v0 = cache_v[0]
 
-            # causal
-            attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(
-                self.head_dim
+            # causal (need to be able to extract logsumexp and wrap with CP)
+            attn_output, logsumexp = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                k0,
+                v0,
+                is_causal=True,
+                dropout_p=0.0,
             )
+
             lck = len(cache_k)
 
-            attn_weights = attn_weights + attention_mask
+            def combine_lse(o0: torch.Tensor, lse0: torch.Tensor, o1: torch.Tensor, lse1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                lse = torch.logaddexp(lse0, lse1)
+                return (
+                    o0 * torch.exp(lse0 - lse) + o1 * torch.exp(lse1 - lse),
+                    lse,
+                )
 
             for i in range(1, lck):
                 ki = cache_k[i]
                 qi = query_states
-                kiq = ki
-
-                attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
-                attn_weights = torch.cat(
-                    (attn_weights, attn_weightsi[..., None]), dim=-1
-                )
-
-            # upcast attention to fp32
-            attn_weights = nn.functional.softmax(
-                attn_weights, dim=-1, dtype=torch.float32
-            ).to(query_states.dtype)
-            attn_weights0 = attn_weights[..., :q_len]
-
-            attn_output = torch.matmul(attn_weights0, v0)
-
-            for i in range(1, lck):
                 vi = cache_v[i]
-                attn_weightsi = attn_weights[..., q_len + i - 1]
-                attn_outputi = attn_weightsi[..., None] * vi
-                attn_output = attn_output + attn_outputi
+
+                attn_weightsi = (qi * ki).sum(-1) / math.sqrt(self.head_dim)
+                attn_output, logsumexp = combine_lse(attn_output, logsumexp, vi, attn_weightsi)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
