@@ -10,6 +10,10 @@ _TP_DEVICE_MESH = None
 _TP_GROUP = None
 _DP_DEVICE_MESH = None
 _DP_GROUP = None
+_CP_DEVICE_MESH = None
+_CP_GROUP = None
+_DP_CP_DEVICE_MESH = None
+_DP_CP_GROUP = None
 
 
 def get_tp_group():
@@ -20,6 +24,16 @@ def get_tp_group():
 def get_dp_group():
     global _DP_GROUP
     return _DP_GROUP
+
+
+def get_cp_group():
+    global _CP_GROUP
+    return _CP_GROUP
+
+
+def get_dp_cp_group():
+    global _DP_CP_GROUP
+    return _DP_CP_GROUP
 
 
 def get_device_mesh():
@@ -37,7 +51,17 @@ def get_dp_device_mesh():
     return _DP_DEVICE_MESH
 
 
-def init_distributed(timeout: int = 10, tp_size: int = 1):
+def get_cp_device_mesh():
+    global _CP_DEVICE_MESH
+    return _CP_DEVICE_MESH
+
+
+def get_dp_cp_device_mesh():
+    global _DP_CP_DEVICE_MESH
+    return _DP_CP_DEVICE_MESH
+
+
+def init_distributed(timeout: int = 10, tp_size: int = 1, cp_size: int = 1):
     """Initialize distributed training.
 
     Args:
@@ -50,23 +74,27 @@ def init_distributed(timeout: int = 10, tp_size: int = 1):
     print_with_rank(f"bind to device {local_rank}")
 
     world_size = dist.get_world_size()
-    dp_size = world_size // tp_size
-    assert world_size == tp_size * dp_size, "world size must be divisible by tp size"
+    dp_size = world_size // tp_size // cp_size
+    assert world_size == tp_size * cp_size * dp_size, "world size must be divisible by tp size * cp size"
     device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda", (dp_size, tp_size), mesh_dim_names=["dp", "tp"]
+        "cuda", (dp_size, tp_size, cp_size), mesh_dim_names=["dp", "tp", "cp"]
     )
+    device_mesh["dp", "cp"]._flatten(mesh_dim_name="dp_cp")
     print_with_rank(f"device mesh: {device_mesh}")
     tp_group = device_mesh.get_group("tp")
+    cp_group = device_mesh.get_group("cp")
     dp_group = device_mesh.get_group("dp")
-
-    # we need to create a 1D submesh
-    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
-    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH
+    dp_cp_group = device_mesh.get_group("dp_cp")
+    global _TP_GROUP, _CP_GROUP, _DP_GROUP, _DP_CP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _CP_DEVICE_MESH, _DP_DEVICE_MESH, _DP_CP_DEVICE_MESH
     _DEVICE_MESH = device_mesh
     _TP_GROUP = tp_group
-    _TP_DEVICE_MESH = tp_device_mesh
+    _TP_DEVICE_MESH = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
+    _CP_GROUP = cp_group
+    _CP_DEVICE_MESH = dist.DeviceMesh.from_group(cp_group, device_type="cuda")
     _DP_GROUP = dp_group
     _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
+    _DP_CP_GROUP = dp_cp_group
+    _DP_CP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_cp_group, device_type="cuda")
 
 
 def destroy_distributed():

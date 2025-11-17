@@ -22,7 +22,7 @@ from specforge.data import (
 )
 from specforge.distributed import (
     destroy_distributed,
-    get_dp_device_mesh,
+    get_dp_cp_device_mesh,
     get_dp_group,
     init_distributed,
 )
@@ -101,6 +101,7 @@ def parse_args():
 
     # distributed training
     parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--cp-size", type=int, default=1)
 
     # other args
     parser.add_argument("--cache-key", type=str, default=None)
@@ -189,9 +190,9 @@ def main():
     # initialize
     parser, args = parse_args()
     set_seed(args.seed)
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size, cp_size=args.cp_size)
     print_with_rank("Initialized distributed environment")
-    args.dp_size = dist.get_world_size() // args.tp_size
+    args.dp_size = dist.get_world_size() // args.tp_size // args.cp_size
     args.draft_accumulation_steps = (
         args.draft_global_batch_size // args.dp_size // args.draft_micro_batch_size
     )
@@ -348,7 +349,7 @@ def main():
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
-    fsdp_config = {"mesh": get_dp_device_mesh(), "mp_policy": mp_policy}
+    fsdp_config = {"mesh": get_dp_cp_device_mesh(), "mp_policy": mp_policy}
     fully_shard(eagle3_model, **fsdp_config)
 
     print_with_rank(f"Initialized Eagle3 FSDP model")
