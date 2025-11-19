@@ -99,6 +99,7 @@ def parse_args():
         default=2000,
         help="Number of files per subdirectory.",
     )
+    parser.add_argument("--mem-fraction-static", type=float, default=0.85)
     return parser.parse_args()
 
 
@@ -130,6 +131,7 @@ def build_target_model(
             torch_dtype=torch.bfloat16,
             device="cuda",
             cache_dir=args.cache_dir,
+            mem_fraction_static=args.mem_fraction_static,
         )
 
     # Set auxiliary hidden states layers if specified

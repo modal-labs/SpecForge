@@ -184,6 +184,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         device: str = None,
         cache_dir: Optional[str] = None,
         trust_remote_code: bool = False,
+        mem_fraction_static: float = 0.4,
         **kwargs,
     ) -> "SGLangEagle3TargetModel":
         tp_size = dist.get_world_size(get_tp_group())
@@ -201,7 +202,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         model_config = ModelConfig.from_server_args(server_args)
         model_runner = SGLangRunner(
             model_config=model_config,
-            mem_fraction_static=0.4,
+            mem_fraction_static=mem_fraction_static,
             gpu_id=torch.cuda.current_device(),
             tp_rank=dist.get_rank(get_tp_group()),
             tp_size=server_args.tp_size,
