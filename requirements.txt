@@ -12,5 +12,5 @@ psutil
 numpy
 accelerate
 pydantic
-sglang[all]==0.5.4
+sglang==0.5.5.post2
 openai-harmony
