@@ -23,6 +23,7 @@
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -75,6 +76,7 @@ class OnlineEagle3Model(Eagle3Model):
         hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
+        sequence_offset: int = 0,
         **kwargs,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
@@ -86,6 +88,8 @@ class OnlineEagle3Model(Eagle3Model):
             loss_mask: (batch, seq_len)
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
+            sequence_offset: starting position index for the local sequence shard when
+                using context-parallel sharding.
         """
         # Step 1: handle vocab size
         target_p_padded, position_mask = _compute_target_p_padded(
@@ -110,9 +114,10 @@ class OnlineEagle3Model(Eagle3Model):
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
             device = hidden_states.device
+            base_position = sequence_offset + past_key_values_length
             position_ids = torch.arange(
-                past_key_values_length,
-                seq_length + past_key_values_length,
+                base_position,
+                base_position + seq_length,
                 dtype=torch.long,
                 device=device,
             )
@@ -135,6 +140,8 @@ class OnlineEagle3Model(Eagle3Model):
                 seq_length=seq_length,
                 past_key_values_length=past_key_values_length,
             )
+        elif self.attention_backend == "ring_context_parallel":
+            attention_mask = None
 
         # Step 5: run TTT
         plosses = []
@@ -146,6 +153,9 @@ class OnlineEagle3Model(Eagle3Model):
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
+        elif self.attention_backend == "ring_context_parallel":
+            cache_hidden = None
+            past_key_values = None
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
@@ -607,6 +617,11 @@ def _compute_target_p(target, t2d, loss_mask):
 
 @torch.compile(dynamic=None)
 def _compute_metric_acc(logits, target_p, position_mask, loss_mask):
-    return (
+    correct = (
         (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
-    ).sum() / loss_mask.sum().clamp_min(1e-6)
+    ).sum()
+    total = loss_mask.sum().clamp_min(1e-6)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+    return (correct / total.clamp_min(1e-6)).to(logits.dtype)

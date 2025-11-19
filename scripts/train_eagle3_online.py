@@ -24,6 +24,9 @@ from specforge import (
     OnlineEagle3Model,
     QwenVLOnlineEagle3Model,
 )
+from specforge.context_parallel.sharding import (
+    shard_eagle3_output_for_context_parallel,
+)
 from specforge.data import (
     build_eagle3_dataset,
     generate_vocab_mapping_file,
@@ -125,7 +128,12 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         default=20,
         help="Timeout for collective communication in minutes",
     )
-    parser.add_argument("--attention-backend", type=str, default="flex_attention")
+    parser.add_argument(
+        "--attention-backend",
+        type=str,
+        default="flex_attention",
+        choices=["sdpa", "flex_attention", "ring_context_parallel"],
+    )
 
     # resume
     parser.add_argument("--resume", action="store_true")
@@ -483,7 +491,12 @@ def run_forward(
         )
         eagle3_data.loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
         eagle3_data.target = get_dp_data_shard_from_tp(eagle3_data.target)
-        eagle3_data.hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+        eagle3_data.hidden_states = get_dp_data_shard_from_tp(
+            eagle3_data.hidden_states
+        )
+
+        if args.attention_backend == "ring_context_parallel":
+            eagle3_data = shard_eagle3_output_for_context_parallel(eagle3_data)
 
         plosses, _, acces = eagle3_model(
             input_ids=eagle3_data.input_ids,
@@ -491,6 +504,7 @@ def run_forward(
             loss_mask=eagle3_data.loss_mask,
             target=eagle3_data.target,
             hidden_states=eagle3_data.hidden_states,
+            sequence_offset=getattr(eagle3_data, "sequence_offset", 0),
         )
     return plosses, acces
 

@@ -113,7 +113,7 @@ def parse_args():
         "--draft-attention-backend",
         type=str,
         default="flex_attention",
-        choices=["flex_attention", "sdpa"],
+        choices=["flex_attention", "sdpa", "ring_context_parallel"],
     )
 
     # resume

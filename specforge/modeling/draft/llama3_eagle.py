@@ -11,6 +11,10 @@ from transformers.cache_utils import Cache
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from specforge.context_parallel import (
+    RingAttentionBackend,
+    ring_scaled_dot_product_attention,
+)
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
@@ -603,7 +607,7 @@ class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config):
+    def __init__(self, config, attention_backend: str = "sdpa"):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -628,6 +632,8 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
+        self.attention_backend = attention_backend
+        self.use_ring_attention = attention_backend == "ring_context_parallel"
         self._init_rope()
 
     def _init_rope(self):
@@ -770,14 +776,29 @@ class LlamaAttention(nn.Module):
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask=attention_mask,
-                is_causal=attention_mask is None,
-                dropout_p=0.0,
-            )
+            if self.use_ring_attention:
+                if attention_mask is not None:
+                    raise ValueError(
+                        "ring_context_parallel backend expects attention_mask=None"
+                    )
+                attn_output = ring_scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=True,
+                    backend=RingAttentionBackend.FLASH,
+                )
+            else:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=attention_mask,
+                    is_causal=attention_mask is None,
+                    dropout_p=0.0,
+                )
 
         else:
             lck = len(cache_hidden[0])
@@ -1047,7 +1068,14 @@ class LlamaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         if attention_backend == "sdpa":
-            self.self_attn = LlamaAttention(config=config)
+            self.self_attn = LlamaAttention(
+                config=config, attention_backend="sdpa"
+            )
+        elif attention_backend == "ring_context_parallel":
+            print_with_rank("Using ring context-parallel attention backend!")
+            self.self_attn = LlamaAttention(
+                config=config, attention_backend="ring_context_parallel"
+            )
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)

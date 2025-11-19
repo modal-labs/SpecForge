@@ -90,7 +90,12 @@ def parse_args():
         default=7,
         help="The length for Test-Time Training (TTT).",
     )
-    parser.add_argument("--draft-attention-backend", type=str, default="flex_attention")
+    parser.add_argument(
+        "--draft-attention-backend",
+        type=str,
+        default="flex_attention",
+        choices=["sdpa", "flex_attention", "ring_context_parallel"],
+    )
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
     parser.add_argument(

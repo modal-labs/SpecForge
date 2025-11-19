@@ -32,6 +32,8 @@ class Eagle3TargetOutput:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     last_hidden_states: Optional[torch.Tensor] = None
+    sequence_offset: int = 0
+    global_seq_length: Optional[int] = None
 
 
 class Eagle3TargetModel(ABC):
@@ -103,6 +105,8 @@ class Eagle3TargetModel(ABC):
             loss_mask=loss_mask,
             input_ids=input_ids,
             attention_mask=attention_mask,
+            sequence_offset=0,
+            global_seq_length=hidden_states.shape[1],
         )
 
     def set_aux_hidden_states_layers(
