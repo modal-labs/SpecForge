@@ -93,7 +93,14 @@ class CustomEvalBenchmark(BaseBenchmark):
                     s += sgl.assistant(content)
 
             # Generate the response
-            s += sgl.assistant(sgl.gen("answer", max_tokens=self.get_max_new_tokens()))
+            s += sgl.assistant(
+                sgl.gen(
+                    "answer",
+                    max_tokens=self.get_max_new_tokens(),
+                    temperature=0.4,
+                    top_p=1.0,
+                )
+            )
 
         return chat_gen
 
@@ -105,8 +112,12 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-path", type=str, required=True, help="Path to the dataset")
-    parser.add_argument("--num-questions", type=int, default=None, help="Number of questions to run")
+    parser.add_argument(
+        "--dataset-path", type=str, required=True, help="Path to the dataset"
+    )
+    parser.add_argument(
+        "--num-questions", type=int, default=None, help="Number of questions to run"
+    )
     parser.add_argument("--num-runs", type=int, default=1, help="Number of runs")
     args = add_common_sglang_args_and_parse(parser)
     main(args)
