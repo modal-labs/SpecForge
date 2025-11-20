@@ -28,9 +28,12 @@ def assert_similar(ref, out):
 
 
 class TestFlashAttention(unittest.TestCase):
-
     def setUp(self):
+        import os
+
         torch.manual_seed(0)
+
+        self.backend = os.environ.get("FLASH_ATTN_BACKEND", "fa")
         self.config_dict = {
             "hidden_size": 128,
             "num_attention_heads": 8,
@@ -57,7 +60,11 @@ class TestFlashAttention(unittest.TestCase):
     def _test_forward_pass_comparison_for_seq_len(self, seq_len):
         """Helper method to test forward pass comparison for a specific sequence length."""
         attention = LlamaAttention(self.config).to("cuda").to(self.dtype)
-        flash_attention = LlamaFlashAttention(self.config).to("cuda").to(self.dtype)
+        flash_attention = (
+            LlamaFlashAttention(self.config, backend=self.backend)
+            .to("cuda")
+            .to(self.dtype)
+        )
 
         # Ensure same weights
         with torch.no_grad():
@@ -144,7 +151,11 @@ class TestFlashAttention(unittest.TestCase):
     def _test_backward_pass_gradient_comparison_for_seq_len(self, seq_len):
         """Helper method to test backward pass gradient comparison for a specific sequence length."""
         attention = LlamaAttention(self.config).to("cuda").to(self.dtype)
-        flash_attention = LlamaFlashAttention(self.config).to("cuda").to(self.dtype)
+        flash_attention = (
+            LlamaFlashAttention(self.config, backend=self.backend)
+            .to("cuda")
+            .to(self.dtype)
+        )
 
         # Ensure same weights
         with torch.no_grad():
