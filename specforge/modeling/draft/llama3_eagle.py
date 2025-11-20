@@ -11,6 +11,7 @@ from transformers.cache_utils import Cache
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.models.llama.configuration_llama import LlamaConfig
 from flash_attn import flash_attn_func
+from flash_attn.cute import flash_attn_func as flash_attn_func_v4
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
@@ -530,7 +531,6 @@ def yarn_linear_ramp_mask(min_val, max_val, dim):
 
 
 class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
-
     def __init__(
         self,
         dim,
@@ -988,6 +988,10 @@ class LlamaFlashAttention(LlamaAttention):
         - cache_hidden: manual cache used for storing past key and value states
     """
 
+    def __init__(self, config, backend="fa"):
+        super().__init__(config)
+        self.backend = backend
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1004,9 +1008,7 @@ class LlamaFlashAttention(LlamaAttention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        )
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         )
@@ -1056,7 +1058,12 @@ class LlamaFlashAttention(LlamaAttention):
         k0 = cache_k[0]
         v0 = cache_v[0]
 
-        attn_output, lse, _ = flash_attn_func(
+        if self.backend == "fa4":
+            attn_func = flash_attn_func_v4
+        else:
+            attn_func = flash_attn_func
+
+        attn_output, lse, _ = attn_func(
             query_states,
             k0,
             v0,
@@ -1069,7 +1076,13 @@ class LlamaFlashAttention(LlamaAttention):
 
         lck = len(cache_k)
         if lck > 1:
-            q_shape_expanded = (bsz, q_len, self.num_key_value_heads, self.num_key_value_groups, self.head_dim)
+            q_shape_expanded = (
+                bsz,
+                q_len,
+                self.num_key_value_heads,
+                self.num_key_value_groups,
+                self.head_dim,
+            )
             attn_outputs = [attn_output.view(q_shape_expanded)]
             lses = [lse.view(q_shape_expanded[:-1])]
 
@@ -1170,7 +1183,9 @@ class LlamaDecoderLayer(nn.Module):
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
         elif attention_backend == "fa":
-            self.self_attn = LlamaFlashAttention(config=config)
+            self.self_attn = LlamaFlashAttention(config=config, backend="fa")
+        elif attention_backend == "fa4":
+            self.self_attn = LlamaFlashAttention(config=config, backend="fa4")
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
@@ -1240,7 +1255,6 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
-
     config_class = LlamaConfig
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
