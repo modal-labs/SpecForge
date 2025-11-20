@@ -118,6 +118,17 @@ def parse_args():
     )
     # resume
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--resume-checkpoint-path",
+        type=str,
+        default=None,
+        help="Explicit checkpoint directory to resume or finetune from.",
+    )
+    parser.add_argument(
+        "--ignore-optimizer-state",
+        action="store_true",
+        help="Skip loading optimizer/scheduler state when resuming for finetuning.",
+    )
 
     # report backend
     parser.add_argument(
@@ -186,6 +197,29 @@ def parse_args():
     return parser, args
 
 
+def load_training_state_from_checkpoint(
+    checkpoint_dir,
+    optimizer,
+    device_mesh,
+    *,
+    load_optimizer_state=True,
+):
+    """Load training state (and optionally optimizer) from checkpoint_dir."""
+    state_path = os.path.join(checkpoint_dir, "training_state.pt")
+    if not os.path.exists(state_path):
+        print_on_rank0(
+            f"Warning: Checkpoint directory {checkpoint_dir} found, but training_state.pt is missing."
+        )
+        return None
+
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    if load_optimizer_state:
+        optimizer.load_state_dict(state)
+        shard_optimizer_state_with_dtensor(optimizer, device_mesh)
+
+    return state
+
+
 def main():
     # initialize
     parser, args = parse_args()
@@ -199,7 +233,9 @@ def main():
     assert (
         args.draft_accumulation_steps * args.draft_micro_batch_size * args.dp_size
         == args.draft_global_batch_size
-    ), f"draft_global_batch_size={args.draft_global_batch_size} must be divisible by dp_size={args.dp_size} and micro_batch_size={args.draft_micro_batch_size}"
+    ), (
+        f"draft_global_batch_size={args.draft_global_batch_size} must be divisible by dp_size={args.dp_size} and micro_batch_size={args.draft_micro_batch_size}"
+    )
     print_with_rank(
         f"draft_accumulation_steps={args.draft_global_batch_size} // {args.dp_size} // {args.draft_micro_batch_size}={args.draft_accumulation_steps}"
     )
@@ -215,7 +251,16 @@ def main():
 
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None
-    if args.resume and os.path.isdir(args.output_dir):
+    if args.resume_checkpoint_path is not None:
+        if not os.path.isdir(args.resume_checkpoint_path):
+            parser.error(
+                f"Provided resume checkpoint path {args.resume_checkpoint_path} is not a directory"
+            )
+        draft_model_last_checkpoint = args.resume_checkpoint_path
+        print_on_rank0(
+            f"Using provided checkpoint directory: {draft_model_last_checkpoint}"
+        )
+    elif args.resume and os.path.isdir(args.output_dir):
         print_on_rank0(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
@@ -309,11 +354,9 @@ def main():
     )
     print_with_rank("Initialized train dataloader")
 
+    steps_per_epoch = math.ceil(len(train_dataloader) / args.draft_accumulation_steps)
     # Calculate total steps if not provided
     if args.total_steps is None:
-        steps_per_epoch = math.ceil(
-            len(train_dataloader) / args.draft_accumulation_steps
-        )
         args.total_steps = args.num_epochs * steps_per_epoch
         print_with_rank(
             f"Auto-calculated total_steps: {args.total_steps} (num_epochs={args.num_epochs} * steps_per_epoch={steps_per_epoch})"
@@ -372,18 +415,29 @@ def main():
         print_on_rank0(
             f"Resuming draft model training from checkpoint: {draft_model_last_checkpoint}"
         )
-        state_path = os.path.join(draft_model_last_checkpoint, "training_state.pt")
+        resume_state = load_training_state_from_checkpoint(
+            draft_model_last_checkpoint,
+            optimizer,
+            get_dp_device_mesh(),
+            load_optimizer_state=not args.ignore_optimizer_state,
+        )
 
-        if os.path.exists(state_path):
-            state = torch.load(state_path, map_location="cpu", weights_only=False)
-            optimizer.load_state_dict(state)
-            shard_optimizer_state_with_dtensor(optimizer, get_dp_device_mesh())
-            start_epoch = state["epoch"] + 1
-            global_step = state.get("global_step", start_epoch * steps_per_epoch)
-            print_on_rank0(f"Resuming from epoch {start_epoch}")
+        if resume_state is not None:
+            if args.ignore_optimizer_state:
+                print_on_rank0(
+                    "Ignoring optimizer state; restarting scheduler and steps from zero."
+                )
+                start_epoch = 0
+                global_step = 0
+            else:
+                resume_epoch = resume_state.get("epoch", -1)
+                start_epoch = resume_epoch + 1
+                default_global_step = start_epoch * steps_per_epoch
+                global_step = resume_state.get("global_step", default_global_step)
+                print_on_rank0(f"Resuming from epoch {start_epoch}")
         else:
             print_on_rank0(
-                f"Warning: Checkpoint directory {draft_model_last_checkpoint} found, but training_state.pt is missing. Starting from scratch."
+                "Checkpoint state missing; starting training from scratch despite resume request."
             )
 
     last_time = time.time()
