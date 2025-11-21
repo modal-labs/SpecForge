@@ -140,7 +140,7 @@ class OnlineEagle3Model(Eagle3Model):
         plosses = []
         vlosses = []
         acces = []
-        if self.attention_backend in ["sdpa", "fa", "fa4"]:
+        if self.attention_backend in ["sdpa", "fa2", "fa4"]:
             cache_hidden = [[], []]
             past_key_values = None
         elif self.attention_backend == "flex_attention":

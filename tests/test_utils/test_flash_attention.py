@@ -27,13 +27,14 @@ def assert_similar(ref, out):
     assert abs(1 - norm_ratio) <= 0.025, f"{norm_ratio=}"
 
 
-class TestFlashAttention(unittest.TestCase):
-    def setUp(self):
-        import os
+class TestFlashAttentionBase:
+    """Base class for Flash Attention tests."""
 
+    backend: str = None  # set by subclass
+
+    def setUp(self):
         torch.manual_seed(0)
 
-        self.backend = os.environ.get("FLASH_ATTN_BACKEND", "fa")
         self.config_dict = {
             "hidden_size": 128,
             "num_attention_heads": 8,
@@ -243,6 +244,14 @@ class TestFlashAttention(unittest.TestCase):
                 getattr(attention, proj_name).weight.grad,
                 getattr(flash_attention, proj_name).weight.grad,
             )
+
+
+class TestFlashAttention2(TestFlashAttentionBase, unittest.TestCase):
+    backend = "fa2"
+
+
+class TestFlashAttention4(TestFlashAttentionBase, unittest.TestCase):
+    backend = "fa4"
 
 
 if __name__ == "__main__":

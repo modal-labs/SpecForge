@@ -10,14 +10,13 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.models.llama.configuration_llama import LlamaConfig
-from flash_attn import flash_attn_func
-from flash_attn.cute import flash_attn_func as flash_attn_func_v4
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
+from specforge.modeling.draft.flash_attention import resolve_flash_attn_func
 from specforge.utils import print_with_rank
 
 from .base import Eagle3DraftModel
@@ -988,9 +987,9 @@ class LlamaFlashAttention(LlamaAttention):
         - cache_hidden: manual cache used for storing past key and value states
     """
 
-    def __init__(self, config, backend="fa"):
+    def __init__(self, config, backend="fa2"):
         super().__init__(config)
-        self.backend = backend
+        self.flash_attn_func = resolve_flash_attn_func(backend=backend)
 
     def forward(
         self,
@@ -1058,19 +1057,12 @@ class LlamaFlashAttention(LlamaAttention):
         k0 = cache_k[0]
         v0 = cache_v[0]
 
-        if self.backend == "fa4":
-            attn_func = flash_attn_func_v4
-        else:
-            attn_func = flash_attn_func
-
-        attn_output, lse, _ = attn_func(
+        attn_output, lse = self.flash_attn_func(
             query_states,
             k0,
             v0,
-            dropout_p=0.0,
             softmax_scale=1.0 / math.sqrt(self.head_dim),
             causal=True,
-            return_attn_probs=True,
         )
         lse = lse.transpose(1, 2)
 
@@ -1182,8 +1174,8 @@ class LlamaDecoderLayer(nn.Module):
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
-        elif attention_backend == "fa":
-            self.self_attn = LlamaFlashAttention(config=config, backend="fa")
+        elif attention_backend == "fa2":
+            self.self_attn = LlamaFlashAttention(config=config, backend="fa2")
         elif attention_backend == "fa4":
             self.self_attn = LlamaFlashAttention(config=config, backend="fa4")
         else:
