@@ -462,7 +462,7 @@ class Glm4MoeRotaryEmbedding(nn.Module):
             Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
             post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
         """
-        base = config.rope_parameters["rope_theta"]
+        base = getattr(config, "rope_theta", 1000000)
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         dim = int(head_dim * partial_rotary_factor)
@@ -632,7 +632,7 @@ class LlamaAttention(nn.Module):
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
-            target_model_type = getattr(self.config, "taget_model_type", None)
+            target_model_type = getattr(self.config, "target_model_type", None)
             if target_model_type == "glm4_moe":
                 self.rotary_emb = Glm4MoeRotaryEmbedding(
                     config=self.config
