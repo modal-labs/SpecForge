@@ -20,6 +20,17 @@ from benchmarks.base_benchmark import BaseBenchmark
 class CustomEvalBenchmark(BaseBenchmark):
     """Benchmark for custom OpenAI format dataset."""
 
+    def _build_gen_kwargs(self) -> Dict[str, Any]:
+        """Collect optional generation kwargs passed by the user."""
+        gen_kwargs = {}
+        if getattr(self.args, "temperature", None) is not None:
+            gen_kwargs["temperature"] = self.args.temperature
+        if getattr(self.args, "top_p", None) is not None:
+            gen_kwargs["top_p"] = self.args.top_p
+        if getattr(self.args, "max_tokens", None) is not None:
+            gen_kwargs["max_tokens"] = self.args.max_tokens
+        return gen_kwargs
+
     def load_data(self) -> Tuple[List[Dict[str, Any]], List[Any]]:
         """
         Load and preprocess the dataset.
@@ -79,6 +90,8 @@ class CustomEvalBenchmark(BaseBenchmark):
     def create_sgl_function(self) -> Callable:
         """Create the SGL function for inference."""
 
+        gen_kwargs = self._build_gen_kwargs()
+
         @sgl.function
         def chat_gen(s, messages):
             for msg in messages:
@@ -96,9 +109,7 @@ class CustomEvalBenchmark(BaseBenchmark):
             s += sgl.assistant(
                 sgl.gen(
                     "answer",
-                    max_tokens=self.get_max_new_tokens(),
-                    temperature=0.4,
-                    top_p=1.0,
+                    **gen_kwargs,
                 )
             )
 
@@ -119,5 +130,25 @@ if __name__ == "__main__":
         "--num-questions", type=int, default=None, help="Number of questions to run"
     )
     parser.add_argument("--num-runs", type=int, default=1, help="Number of runs")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Optional temperature for generation (uses backend default if omitted).",
+    )
+    parser.add_argument(
+        "--top-p",
+        dest="top_p",
+        type=float,
+        default=None,
+        help="Optional top-p for nucleus sampling (uses backend default if omitted).",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        dest="max_tokens",
+        type=int,
+        default=None,
+        help="Optional max tokens for generation (uses backend default if omitted).",
+    )
     args = add_common_sglang_args_and_parse(parser)
     main(args)
