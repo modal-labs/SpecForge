@@ -206,3 +206,14 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="",
     )
 )
+
+TEMPLATE_REGISTRY.register(
+    name="glm4_moe_nosys",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="",
+    )
+)
+
