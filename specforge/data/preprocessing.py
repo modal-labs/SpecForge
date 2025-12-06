@@ -71,20 +71,29 @@ def _apply_loss_mask_from_chat_template(
     """
     loss_mask = torch.zeros(len(offsets), dtype=torch.long)
 
-    user_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.user_header}"
-    )
-    assistant_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
+    eot = chat_template.end_of_turn_token or ""
+    user_message_separator = f"{eot}{chat_template.user_header}"
+    assistant_message_separator = f"{eot}{chat_template.assistant_header}"
+    tool_message_separator = (
+        f"{eot}{chat_template.tool_header}"
+        if getattr(chat_template, "tool_header", None)
+        else None
     )
 
     # Find spans of assistant responses using regex
-    assistant_pattern = (
-        re.escape(assistant_message_separator)
-        + r"(.*?)(?="
-        + re.escape(user_message_separator)
-        + "|$)"
-    )
+    stop_separators = [user_message_separator]
+    if tool_message_separator:
+        stop_separators.append(tool_message_separator)
+    stop_pattern = "|".join(re.escape(sep) for sep in stop_separators if sep)
+    if stop_pattern:
+        assistant_pattern = (
+            re.escape(assistant_message_separator)
+            + r"(.*?)(?="  # non-greedy
+            + stop_pattern
+            + "|$)"
+        )
+    else:
+        assistant_pattern = re.escape(assistant_message_separator) + r"(.*)$"
 
     matches_found = 0
 
@@ -360,11 +369,15 @@ def build_eagle3_dataset(
             )
         else:
             # Handle ShareGPT conversations
-            if "conversations" not in examples:
+            if "conversations" not in examples and "messages" not in examples:
                 raise ValueError(
-                    f"Expected 'conversations' column for is_preformatted=False, but found columns: {list(examples.keys())}"
+                    f"Expected 'conversations' or 'messages' column for is_preformatted=False, but found columns: {list(examples.keys())}"
                 )
-            conversations = examples.pop("conversations")
+            conversations = (
+                examples.pop("conversations")
+                if "conversations" in examples
+                else examples.pop("messages")
+            )
             if "id" in examples:
                 examples.pop("id")
             processed = preprocess_conversations(

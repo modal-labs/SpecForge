@@ -19,6 +19,8 @@ class ChatTemplate(BaseModel):
     user_header: str | None
     system_prompt: str | None
     end_of_turn_token: str | None
+    # Optional header for tool/observation messages (e.g., "<|observation|>")
+    tool_header: str | None = None
     parser_type: str = "general"
 
 
@@ -205,4 +207,15 @@ TEMPLATE_REGISTRY.register(
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="",
     )
+)
+
+TEMPLATE_REGISTRY.register(
+    name="glm4_moe_tools",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="",
+        tool_header="<|observation|>",
+    ),
 )

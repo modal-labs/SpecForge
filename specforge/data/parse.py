@@ -47,6 +47,11 @@ class GeneralParser(Parser):
         self.assistant_message_separator = (
             f"{chat_template.end_of_turn_token or ''}{chat_template.assistant_header}"
         )
+        self.tool_message_separator = (
+            f"{chat_template.end_of_turn_token or ''}{chat_template.tool_header}"
+            if getattr(chat_template, "tool_header", None)
+            else None
+        )
 
     def parse(
         self,
@@ -70,15 +75,8 @@ class GeneralParser(Parser):
                 if self.system_prompt:
                     messages.append({"role": "system", "content": self.system_prompt})
 
-            convroles = ["user", "assistant"]
-            for j, sentence in enumerate(conversation):
-                role = sentence["role"]
-                if role != convroles[j % 2]:
-                    warnings.warn(
-                        f"Conversation truncated due to unexpected role '{role}'. Expected '{convroles[j % 2]}'."
-                    )
-                    break
-                messages.append(sentence)
+            # Keep full message stream (including tool/observation turns) without enforcing alternation
+            messages.extend(conversation)
 
             conversation = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False, **kwargs
@@ -99,13 +97,23 @@ class GeneralParser(Parser):
         offsets = encoding.offset_mapping[0]
         loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
 
-        # Find spans of assistant responses using regex
-        assistant_pattern = (
-            re.escape(self.assistant_message_separator)
-            + r"(.*?)(?="
-            + re.escape(self.user_message_separator)
-            + "|$)"
-        )
+        # Build a regex that stops at user or tool turns to avoid masking tool outputs
+        stop_separators = [self.user_message_separator]
+        if self.tool_message_separator:
+            stop_separators.append(self.tool_message_separator)
+        stop_pattern = "|".join(re.escape(sep) for sep in stop_separators if sep)
+        if stop_pattern:
+            assistant_pattern = (
+                re.escape(self.assistant_message_separator)
+                + r"(.*?)(?="  # non-greedy
+                + stop_pattern
+                + "|$)"
+            )
+        else:
+            assistant_pattern = (
+                re.escape(self.assistant_message_separator) + r"(.*)$"
+            )
+
         for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
             # Assistant response text span (excluding assistant_header itself)
             assistant_start_char = match.start(1)
