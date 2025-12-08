@@ -72,7 +72,7 @@ class CustomEvalBenchmark(BaseBenchmark):
                     # Check if last message is assistant
                     if full_conv[-1]["role"] == "assistant":
                         context_messages = full_conv[:-1]
-                        label = full_conv[-1]["content"]
+                        label = full_conv[-1].get("content")
                     else:
                         # If last message is user, we just generate a response
                         context_messages = full_conv
@@ -153,6 +153,12 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Optional max tokens for generation (uses backend default if omitted).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Optional port for the server (uses backend default if omitted).",
     )
     args = add_common_sglang_args_and_parse(parser)
     main(args)
