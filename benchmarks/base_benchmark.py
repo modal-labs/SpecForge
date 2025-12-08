@@ -5,6 +5,7 @@ Base class for benchmark implementations.
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from unittest.case import skip
 
 import numpy as np
 import sglang as sgl
@@ -108,7 +109,7 @@ class BaseBenchmark(ABC):
         """
         return getattr(self.args, "max_new_tokens", 2048)
 
-    def run(self):
+    def run(self, skip_labels: bool = False):
         """
         Run the benchmark evaluation.
 
@@ -172,12 +173,8 @@ class BaseBenchmark(ABC):
             accuracy = None
             # Check if we have a labels list (even if all labels are None)
             has_labels_list = self.labels and len(self.labels) > 0
-            # Check if we have valid labels (not all None)
-            has_valid_labels = has_labels_list and any(
-                label is not None for label in self.labels
-            )
 
-            if has_labels_list:
+            if has_labels_list and not skip_labels:
                 # Always call compute_accuracy if we have a labels list
                 # This allows it to return None, which will be displayed in print_results
                 accuracy = self.compute_accuracy(predictions, self.labels)
@@ -199,7 +196,7 @@ class BaseBenchmark(ABC):
             )
             # Always set accuracy if we have a labels list (even if compute_accuracy returns None)
             # This allows print_results to show None when compute_accuracy returns None
-            if has_labels_list:
+            if has_labels_list and not skip_labels:
                 metrics.accuracy = (
                     accuracy  # Can be None if compute_accuracy returns None
                 )
