@@ -154,11 +154,5 @@ if __name__ == "__main__":
         default=None,
         help="Optional max tokens for generation (uses backend default if omitted).",
     )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=None,
-        help="Optional port for the server (uses backend default if omitted).",
-    )
     args = add_common_sglang_args_and_parse(parser)
     main(args)
