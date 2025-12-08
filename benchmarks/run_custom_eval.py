@@ -59,23 +59,27 @@ class CustomEvalBenchmark(BaseBenchmark):
                     if not line.strip():
                         continue
                     data = json.loads(line)
+
+                    full_conv = None
                     if "conversations" in data:
                         # Take all messages except the last one (which is the assistant's response to generate)
                         full_conv = data["conversations"]
-                        if not full_conv:
-                            continue
+                    elif "messages" in data:
+                        full_conv = data["messages"]
+                    if not full_conv:
+                        continue
 
-                        # Check if last message is assistant
-                        if full_conv[-1]["role"] == "assistant":
-                            context_messages = full_conv[:-1]
-                            label = full_conv[-1]["content"]
-                        else:
-                            # If last message is user, we just generate a response
-                            context_messages = full_conv
-                            label = None
+                    # Check if last message is assistant
+                    if full_conv[-1]["role"] == "assistant":
+                        context_messages = full_conv[:-1]
+                        label = full_conv[-1]["content"]
+                    else:
+                        # If last message is user, we just generate a response
+                        context_messages = full_conv
+                        label = None
 
-                        questions.append({"messages": context_messages})
-                        labels.append(label)
+                    questions.append({"messages": context_messages})
+                    labels.append(label)
         except Exception as e:
             print(f"Error loading data: {e}")
             return [], []
