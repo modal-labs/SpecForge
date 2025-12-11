@@ -71,14 +71,11 @@ def _apply_loss_mask_from_chat_template(
     """
     loss_mask = torch.zeros(len(offsets), dtype=torch.long)
 
-    user_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.user_header}"
-    )
-    assistant_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
-    )
+    eot = chat_template.end_of_turn_token or ""
+    user_message_separator = f"{eot}{chat_template.user_header}"
+    assistant_message_separator = f"{eot}{chat_template.assistant_header}"
 
-    # Find spans of assistant responses using regex
+    # Find spans of assistant responses using regex and keep only the LAST one
     assistant_pattern = (
         re.escape(assistant_message_separator)
         + r"(.*?)(?="
@@ -86,25 +83,20 @@ def _apply_loss_mask_from_chat_template(
         + "|$)"
     )
 
-    matches_found = 0
-
+    last_match = None
     for match in re.finditer(assistant_pattern, text, re.DOTALL):
-        matches_found += 1
-        # Assistant response text span (excluding assistant_header itself)
-        assistant_start_char = match.start(1)
-        assistant_end_char = match.end(1)
+        last_match = match
 
-        # Mark tokens overlapping with assistant response
-        for idx, (token_start, token_end) in enumerate(offsets):
-            # Token is part of the assistant response span
-            if token_end <= assistant_start_char:
-                continue  # token before assistant text
-            if token_start > assistant_end_char:
-                continue  # token after assistant text
-            loss_mask[idx] = 1
-
-    if matches_found == 0:
+    if last_match is None:
         print("WARNING: No assistant response spans found in the conversation text.")
+        return loss_mask
+
+    assistant_start_char = last_match.start(1)
+    # Mask everything from start of last assistant response to end of sequence
+    for idx, (token_start, token_end) in enumerate(offsets):
+        if token_end <= assistant_start_char:
+            continue
+        loss_mask[idx] = 1
 
     return loss_mask
 
@@ -202,19 +194,14 @@ def preprocess_vlm_conversations(
     # Note: currently, we assume that each example has only one image
     for i, image in enumerate(examples["image"]):
         source = examples["conversations"][i]
+        tools = examples["tools"][i] if "tools" in examples else None
         messages = [{"role": "system", "content": system_prompt}]
         if not source:
             # if the source is None, skip it
             continue
 
-        if source[0]["role"] != "user":
-            # if the first message is not from user, skip it
-            source = source[1:]
-
-        convroles = ["user", "assistant"]
         for j, sentence in enumerate(source):
             role = sentence["role"]
-            assert role == convroles[j % 2], f"unexpected role {role}"
             if role == "user":
                 # if the message is from user and has image, process the image
                 messages.append(
@@ -236,6 +223,7 @@ def preprocess_vlm_conversations(
             messages,
             tokenize=False,
             add_generation_prompt=False,
+            tools=tools,
         )
         # get vision infor use qwen_vl_utils
         if not HAS_QWEN_VL_UTILS:

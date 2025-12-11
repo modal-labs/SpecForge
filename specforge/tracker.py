@@ -133,7 +133,7 @@ class WandbTracker(Tracker):
         if self.rank == 0:
             wandb.login(key=args.wandb_key)
             wandb.init(
-                project=args.wandb_project, name=args.wandb_name, config=vars(args)
+                project=args.wandb_project, name=args.wandb_name, config=vars(args), settings=wandb.Settings(init_timeout=500)
             )
             self.is_initialized = True
 

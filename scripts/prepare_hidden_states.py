@@ -63,6 +63,11 @@ def parse_args():
     parser.add_argument("--output-path", type=str, default=None)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--chat-template", type=str, default="llama3")
+    parser.add_argument(
+        "--is-preformatted",
+        action="store_true",
+        help="If set, dataset must provide a 'text' column with chat template already applied.",
+    )
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
@@ -531,7 +536,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=True
     )
-    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}"
+    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
     # Preprocess on complete, un-sharded dataset
@@ -547,6 +552,7 @@ def main():
             is_vlm=args.is_vlm,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
+            is_preformatted=args.is_preformatted,
         )
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
 

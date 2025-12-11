@@ -70,18 +70,16 @@ class GeneralParser(Parser):
                 if self.system_prompt:
                     messages.append({"role": "system", "content": self.system_prompt})
 
-            convroles = ["user", "assistant"]
-            for j, sentence in enumerate(conversation):
-                role = sentence["role"]
-                if role != convroles[j % 2]:
-                    warnings.warn(
-                        f"Conversation truncated due to unexpected role '{role}'. Expected '{convroles[j % 2]}'."
-                    )
-                    break
-                messages.append(sentence)
+            # Keep the conversation order as-is (no alternating role enforcement)
+            messages.extend(conversation)
 
+            tools = kwargs.pop("tools", None)
             conversation = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False, **kwargs
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+                tools=tools,
+                **kwargs,
             )
 
         if not self.tokenizer.pad_token_id:
@@ -99,26 +97,26 @@ class GeneralParser(Parser):
         offsets = encoding.offset_mapping[0]
         loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
 
-        # Find spans of assistant responses using regex
+        # Find spans of assistant responses using regex (only keep the LAST assistant span)
         assistant_pattern = (
             re.escape(self.assistant_message_separator)
             + r"(.*?)(?="
             + re.escape(self.user_message_separator)
             + "|$)"
         )
+        last_match = None
         for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
-            # Assistant response text span (excluding assistant_header itself)
-            assistant_start_char = match.start(1)
-            assistant_end_char = match.end(1)
+            last_match = match
 
-            # Mark tokens overlapping with assistant response
+        if last_match is not None:
+            assistant_start_char = last_match.start(1)
+            # Mask everything from the start of the last assistant response to the end
             for idx, (token_start, token_end) in enumerate(offsets):
-                # Token is part of the assistant response span
                 if token_end <= assistant_start_char:
-                    continue  # token before assistant text
-                if token_start > assistant_end_char:
-                    continue  # token after assistant text
+                    continue
                 loss_mask[idx] = 1
+        else:
+            warnings.warn("No assistant response found; loss mask left all zeros.")
         return input_ids, loss_mask
 
 
