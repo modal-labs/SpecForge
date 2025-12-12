@@ -24,10 +24,14 @@ def render_example(
     tokenizer,
     messages: List[Dict[str, Any]],
     add_generation_prompt: bool = True,
+    tools: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Render messages with tokenizer chat template."""
     return tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=add_generation_prompt
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+        tools=tools,
     )
 
 
@@ -74,8 +78,13 @@ class CustomChatEvalBenchmark(BaseBenchmark):
                 else:
                     context = conv
 
+                tools = data.get("tools")
+
                 rendered = render_example(
-                    tokenizer, context, add_generation_prompt=True
+                    tokenizer,
+                    context,
+                    add_generation_prompt=True,
+                    tools=tools,
                 )
                 questions.append({"prompt": rendered})
                 labels.append(label)
