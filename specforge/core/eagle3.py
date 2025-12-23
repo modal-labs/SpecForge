@@ -284,7 +284,7 @@ class OnlineEagle3Model(Eagle3Model):
             # Step 5.6: calculate loss
             # Save logits for OPD before in-place modification
             if self.use_opd:
-                logits_for_opd = logits.detach().clone()
+                logits_for_opd = logits.clone()
 
             # CE loss (in-place modifies logits!)
             if self.lambda_ce > 0.0:
@@ -692,7 +692,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             # Step 5.6: calculate loss
             # Save logits for OPD before in-place modification
             if self.use_opd:
-                logits_for_opd = logits.detach().clone()
+                logits_for_opd = logits.clone()
 
             # CE loss (in-place modifies logits!)
             if self.lambda_ce > 0.0:
