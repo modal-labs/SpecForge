@@ -361,7 +361,7 @@ def sanity_check(args: Namespace) -> None:
         )
 
 
-def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
+def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module, Optional[str]]:
     # Handle draft model config
     if args.draft_model_config is None:
         # Auto-generate and save config file
@@ -406,7 +406,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
-    return draft_model_config, draft_model
+    return draft_model_config, draft_model, draft_model_last_checkpoint
 
 
 def build_dataloaders(
@@ -678,7 +678,7 @@ def main():
     # ================================================
     # 2. Build models
     # ================================================
-    draft_model_config, draft_model = build_draft_model(args)
+    draft_model_config, draft_model, draft_model_last_checkpoint = build_draft_model(args)
     target_model, processor = build_target_model(args, draft_model_config, is_online)
 
     # ================================================
@@ -758,17 +758,31 @@ def main():
     print_with_rank("Initialized optimizer and scheduler")
 
     # ================================================
-    # 6. Build tracker
+    # 6. Load training state if resuming
     # ================================================
-    tracker = build_tracker(args, parser)
     global_step = 0
     start_epoch = 0
+    if args.resume and draft_model_last_checkpoint:
+        training_state_path = os.path.join(draft_model_last_checkpoint, "training_state.pt")
+        if os.path.exists(training_state_path):
+            training_state = torch.load(training_state_path, map_location="cpu")
+            start_epoch = training_state.get("epoch", 0)
+            global_step = training_state.get("global_step", 0)
+            optimizer.load_state_dict(training_state)
+            print_on_rank0(f"Resumed training state from epoch {start_epoch}, global_step {global_step}")
+        else:
+            print_on_rank0(f"Warning: No training_state.pt found at {training_state_path}, starting fresh")
+
+    # ================================================
+    # 7. Build tracker
+    # ================================================
+    tracker = build_tracker(args, parser)
     dist.barrier()
 
     last_time = time.time()
 
     # ================================================
-    # 7. Start training
+    # 8. Start training
     # ================================================
     print_on_rank0(f"Starting training from epoch {start_epoch}")
 

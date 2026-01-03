@@ -4,13 +4,11 @@
 
 This spec defines the intended future state for the Modal training app in `examples/modal/`. The goal is to expose the training benchmark pipeline steps conveniently while avoiding excessive abstraction.
 
-**Scope** (from TODO.md, immediate items only):
+**Scope**:
 1. Train single run with kwargs
 2. Sweeps (same file as training, simple layered config approach)
-3. Dataset regeneration with autoscaling (Modal-native, cache-aware routing)
+3. Dataset regeneration with autoscaling (Modal-native, server-side conversation handling)
 4. SGLang placement for online training (teacher queries - already co-located)
-
-**Out of scope**: Runtime-configurable GPUs, DDP with `@clustered`, token-wise exponential decay tuning, evaluation/benchmarking.
 
 ---
 
@@ -78,6 +76,44 @@ def train_run(
 
 - Default: 8x H100 for full training runs
 - Single GPU variant: `train_run_single_gpu()` with `gpu="H100"` for quick iterations
+
+### Training Preemption and Resume
+
+Training runs support preemption and resume via checkpoint-based recovery:
+
+**Checkpoint Contents:**
+- Model weights (HuggingFace format via `save_pretrained()`)
+- Training state (`training_state.pt`):
+  - `epoch`: Current epoch number
+  - `global_step`: Total steps completed
+  - `optimizer_state_dict`: Optimizer state (AdamW moments, etc.)
+  - `scheduler_state_dict`: LR scheduler state
+
+**Resume Behavior:**
+1. When `resume=True`, training looks for existing checkpoints in `output_dir`
+2. Loads model weights from latest checkpoint via `from_pretrained()`
+3. Loads training state from `training_state.pt`:
+   - Restores `start_epoch` and `global_step`
+   - Restores optimizer and scheduler state
+4. **Dataloader starts fresh** - not resumable with PyTorch DistributedSampler
+
+**Checkpoint Frequency:**
+- Controlled via `save_steps` parameter (default: save at end of each epoch)
+- Balance between resume granularity and storage costs
+
+**Example - Preemption Recovery:**
+```bash
+# Initial training (preempted after 5000 steps)
+modal run modal_train.py train --output-dir my_run --num-epochs 10
+
+# Resume from checkpoint (continues from step 5000)
+modal run modal_train.py train --output-dir my_run --num-epochs 10 --resume
+```
+
+**Modal-Specific Considerations:**
+- Use `modal.Retries` for automatic retry on preemption (with `resume=True`)
+- Checkpoints persist to volume, survive container restarts
+- Training state restoration is fully deterministic (optimizer/scheduler state preserved)
 
 ---
 
@@ -215,28 +251,29 @@ Single Modal function runs N SGLang servers on one node (8 GPUs max), then runs 
 
 ### Target State
 
-Modal-native autoscaling with **cache-aware routing**:
-- Each container runs 1 SGLang server
+Modal-native autoscaling with **server-side conversation handling**:
+- Each container runs 1 SGLang server via `modal.Cls` (best practice for LLM inference)
 - Modal scales containers based on workload
-- **Cache-aware routing** ensures multi-turn conversation samples route to the same container (avoids KV cache misses on prefill)
+- Each server call receives a complete conversation and regenerates all turns internally (no cross-request routing needed)
 
 ### Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      Client (modal_data.py)                 │
-│  - Loads dataset samples                                    │
-│  - Submits samples to regen_server via .map()               │
+│  - Loads dataset samples (each sample = full conversation)  │
+│  - Submits samples to RegenServer.regenerate.spawn_map()    │
 │  - Collects results + checkpoints progress                  │
 └─────────────────────────────────────────────────────────────┘
                               │
-              (Modal routes requests, cache-aware)
+                    (Modal routes requests)
                               ▼
 ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
-│ regen_server│  │ regen_server│  │ regen_server│  ... (Modal autoscales)
-│ (1 SGLang)  │  │ (1 SGLang)  │  │ (1 SGLang)  │
+│ RegenServer │  │ RegenServer │  │ RegenServer │  ... (Modal autoscales)
+│ (modal.Cls) │  │ (modal.Cls) │  │ (modal.Cls) │
+│ SGLang init │  │ SGLang init │  │ SGLang init │
+│ on @enter   │  │ on @enter   │  │ on @enter   │
 │ GPU: H100   │  │ GPU: H100   │  │ GPU: H100   │
-│ KV cache    │  │ KV cache    │  │ KV cache    │
 └─────────────┘  └─────────────┘  └─────────────┘
 ```
 
@@ -297,9 +334,10 @@ def regenerate_dataset(
             time.sleep(1.0)
 
         # Spawn async task
-        fc = regen_server.spawn(
+        fc = RegenServer().regenerate.spawn(
             sample=sample,
             model=model,
+            tp_size=tp_size,
             temperature=temperature,
             max_tokens=max_tokens,
         )
@@ -363,36 +401,83 @@ def regenerate_dataset(
 - Prevents overwhelming Modal's queue
 - 200/sec default = 720k samples/hour submission rate
 
-### Design: Server Side (TBD)
+### Design: Server Side
 
-The regen server is a Modal function with SGLang. **Cache-aware routing configuration is TBD** - this will be designed hands-on using Modal's undocumented cache-aware routing system.
+The regen server uses `modal.Cls` (best practice for LLM inference on Modal). SGLang is initialized lazily on first request and reused across subsequent requests in the same container. Each request receives a complete conversation and regenerates all assistant turns internally.
 
 ```python
-@app.function(
+@app.cls(
     gpu="H100",  # or "H100:2" for larger models
     image=sglang_image,
     secrets=[hf_secret],
     timeout=600,  # 10min per sample max
-    # TODO: cache-aware routing config (Modal-specific, TBD)
 )
-def regen_server(
-    sample: dict,  # Single conversation sample
-    model: str,
-    temperature: float = 0.7,
-    max_tokens: int = 4096,
-) -> dict:
-    """Regenerate a single sample using local SGLang server."""
-    # 1. Start/reuse SGLang server on localhost (container-local)
-    # 2. Process sample via OpenAI-compatible API
-    # 3. Return regenerated conversation
-    ...
+class RegenServer:
+    def __init__(self):
+        self.engine = None
+        self.current_model = None
+
+    @modal.method()
+    def regenerate(
+        self,
+        sample: dict,  # Complete conversation with all turns
+        model: str,
+        tp_size: int = 1,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> dict:
+        """Regenerate all assistant turns in a conversation.
+
+        The sample contains the full multi-turn conversation. This method:
+        1. Lazily initializes SGLang engine on first request
+        2. Iterates through turns, keeping user messages as-is
+        3. For each assistant turn, generates a new response using the
+           conversation history up to that point
+        4. Returns the conversation with regenerated assistant responses
+        """
+        # Lazy engine initialization (once per container)
+        if self.engine is None:
+            import sglang as sgl
+            self.engine = sgl.Engine(model_path=model, tp_size=tp_size)
+            self.current_model = model
+
+        messages = sample["messages"]
+        regenerated_messages = []
+
+        for msg in messages:
+            if msg["role"] == "user":
+                regenerated_messages.append(msg)
+            elif msg["role"] == "assistant":
+                # Generate new assistant response from conversation so far
+                response = self.engine.generate(
+                    prompt=regenerated_messages,  # Context up to this point
+                    sampling_params={
+                        "temperature": temperature,
+                        "max_new_tokens": max_tokens,
+                    },
+                )
+                regenerated_messages.append({
+                    "role": "assistant",
+                    "content": response["text"],
+                })
+
+        return {
+            "id": sample["id"],
+            "messages": regenerated_messages,
+        }
+
+    @modal.exit()
+    def shutdown_engine(self):
+        """Clean up SGLang engine on container shutdown."""
+        if self.engine is not None:
+            self.engine.shutdown()
 ```
 
-**Server-side design notes** (to be finalized during implementation):
-- Container startup: SGLang server initialization on first request
-- KV cache reuse: Multi-turn samples should route to same container
-- Health checks: Handle server startup failures gracefully
-- GPU scaling: `tp_size` determines GPU count per container
+**Server-side design notes**:
+- **Lazy initialization**: SGLang engine initializes on first request, not container startup (avoids cold start if container never used)
+- **Full conversation handling**: Each request regenerates all assistant turns internally, building context incrementally
+- **No cross-request routing**: KV cache is used within a single request's multi-turn generation, not across requests
+- **GPU scaling**: `tp_size` parameter determines GPU count per container
 
 ### Fault Tolerance
 
@@ -436,7 +521,7 @@ Uncolocated teacher engines (separate containers) would require a significant Sp
 examples/modal/
 ├── common.py               # Shared: volumes, images, secrets, utilities
 ├── modal_train.py          # train_run(), train_run_single_gpu(), sweep(), sweep configs
-├── modal_data.py           # prep_dataset(), regenerate_dataset(), regen_server(), preprocess_dataset()
+├── modal_data.py           # prep_dataset(), regenerate_dataset(), RegenServer, preprocess_dataset()
 ├── test_train.py           # Tests for modal_train.py
 ├── test_data.py            # Tests for modal_data.py
 └── README.md               # Usage examples
@@ -602,7 +687,7 @@ Each test:
 - `prep_dataset()` - convert raw data to JSONL
 - `preprocess_dataset()` - tokenize + vocab mapping generation
 - `regenerate_dataset()` - rate-limited client with checkpointing
-- `regen_server()` - server-side TBD for cache-aware routing
+- `RegenServer` class - modal.Cls with SGLang for full conversation regeneration
 - Local entrypoint with CLI subcommands: `prep`, `regen`, `preprocess`
 
 ### Step 3: Create `modal_train.py`
